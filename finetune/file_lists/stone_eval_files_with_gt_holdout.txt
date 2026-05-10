@@ -1,0 +1,12 @@
+stone_01/images/image_00.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0001.png 7291.9239
+stone_01/images/image_10.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0011.png 7291.9239
+stone_01/images/image_20.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0021.png 7291.9239
+stone_01/images/image_30.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0031.png 7291.9239
+stone_01/images/image_40.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0041.png 7291.9239
+stone_01/images/image_50.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0051.png 7291.9239
+stone_01/images/image_60.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0061.png 7291.9239
+stone_01/images/image_70.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0071.png 7291.9239
+stone_01/images/image_80.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0081.png 7291.9239
+stone_01/images/image_90.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0091.png 7291.9239
+stone_01/images/image_100.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0101.png 7291.9239
+stone_01/images/image_110.png data_depth_annotated/train/groundtruth_float32png/stone_01/depth_0111.png 7291.9239
