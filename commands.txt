@@ -1,0 +1,13 @@
+### convert exr to npy
+python3 convert_exr_to_npy.py \
+  --input_dir stone_syn_dataset/data_depth_annotated/train/groundtruth/stone_01_depth/ \
+  --output_dir stone_syn_dataset/stone_01_depth_npy \
+  --recursive
+
+###Clone from github
+git clone -b main https://github.com/dushhunter/MscProjectLatest/stone_syn_dataset/data_depth_annotated/train/groundtruth stone_syn_dataset/stone_01_depth_ex
+
+###Push to github
+git add -A reconstruct_stone_3d_sparse.py
+git commit -m "Initial commit: 3d add"
+git push https://dushhunter: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@github.com/dushhunter/MscProjectLatest.git HEAD:main
