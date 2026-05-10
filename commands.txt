@@ -11,3 +11,10 @@ git clone -b main https://github.com/dushhunter/MscProjectLatest/stone_syn_datas
 git add -A reconstruct_stone_3d_sparse.py
 git commit -m "Initial commit: 3d add"
 git push https://dushhunter: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@github.com/dushhunter/MscProjectLatest.git HEAD:main
+
+###3d recons run
+python reconstruct_stone_3d_sparse.py \
+  --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
+  --intrinsics splits/stone/intrinsics.txt --sequence stone_01 \
+  --width 1024 --height 576 \
+  --output_dir reconstruction_output_sparse_n24
