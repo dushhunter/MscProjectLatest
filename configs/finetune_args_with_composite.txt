@@ -1,0 +1,44 @@
+--name stone_syn_finetune
+--root exps/stone_syn_finetune_absreal_weight10_smoothness_test6
+--load_weights_folder stone_weights/my_stone_experiment_32bit_L1/models/weights_10
+--epochs 5
+--bs 1
+--lr 1e-4
+--wd 0.01
+--div_factor 10
+--final_div_factor 100
+--validate_every 100
+--dataset stone
+--workers 10
+--w_chamfer 0
+--data_path stone_syn_dataset/
+--gt_path stone_syn_dataset/
+--filenames_file ./finetune/file_lists/stone_train_files_with_gt.txt
+--input_height 576
+--input_width 1024
+--amp
+--min_depth 0.01
+--max_depth 1.0
+--depth_encoding float32_rgba
+--data_path_eval stone_syn_dataset/
+--gt_path_eval stone_syn_dataset/
+--filenames_file_eval ./finetune/file_lists/stone_eval_files_with_gt.txt
+--min_depth_eval 0.01
+--max_depth_eval 1.0
+--same_lr
+--l1_weight 1
+--gt_grad_weight 0.7
+--gt_normal_weight 0.3
+--use_background_smoothness_loss
+--background_smoothness_weight 0.00005
+--background_edge_percentile 85
+--best_model_selection composite
+--composite_w_mae_mm 1.0
+--composite_w_p95_mm 0.75
+--composite_w_normal_deg 1600
+--composite_w_edge_mae_mm 1.1
+--composite_w_abs_rel 100
+--composite_edge_percentile 85
+--mlflow
+--mlflow_experiment_name StoneVolMain-finetune-composite-weight10-test6-smoothness
+--mlflow_tags pipeline=finetune,dataset=stone
