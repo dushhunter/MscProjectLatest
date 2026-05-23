@@ -1,0 +1,53 @@
+# Neural sparse stone reconstruction (2024-2026 SOTA stack)
+#
+# Two install profiles:
+#   profile_cpu : everything except the GPU-only neural backbones. Lets
+#                 reconstruct_stone_3d_neural.py run in `auto` mode which
+#                 transparently falls back to the classical pipeline.
+#   profile_gpu : adds PARE-Net, SGHR, NKSR, NoKSR, PointTransformerV3
+#                 (all of which require a CUDA toolchain to compile).
+#
+# Pinned versions are tested against CUDA 12.1 + PyTorch 2.2.2.
+#
+# ---------------------------------------------------------------------
+# profile_cpu (always installable)
+# ---------------------------------------------------------------------
+numpy==1.26.4
+scipy==1.15.3
+matplotlib==3.10.9
+pillow==12.2.0
+opencv-python-headless==4.9.0.80
+open3d==0.18.0
+markdown-pdf==1.13.1
+
+# CPU torch for development and code structure. On the GPU box, replace
+# with the CUDA 12.1 wheels:
+#   pip install torch==2.2.2 torchvision==0.17.2 --index-url \
+#     https://download.pytorch.org/whl/cu121
+torch==2.2.2
+
+# ---------------------------------------------------------------------
+# profile_gpu (CUDA 12.1 + 15GB VRAM required)
+# ---------------------------------------------------------------------
+# These are commented out by default because they fail to install on a
+# CPU-only host. Uncomment on the GPU box.
+#
+# # PointTransformerV3 backbone (segmentation).
+# spconv-cu121==2.3.6
+# git+https://github.com/Pointcept/PointTransformerV3.git@main#egg=ptv3
+#
+# # PARE-Net pairwise registration.
+# git+https://github.com/yaorz97/PARENet.git@main#egg=parenet
+#
+# # GeoTransformer pairwise fallback.
+# git+https://github.com/qinzheng93/GeoTransformer.git@main#egg=geotransformer
+#
+# # SGHR multi-view registration (needs MinkowskiEngine).
+# git+https://github.com/NVIDIA/MinkowskiEngine.git@v0.5.4#egg=MinkowskiEngine
+# git+https://github.com/WHU-USI3DV/SGHR.git@main#egg=sghr
+#
+# # NKSR neural surface reconstruction.
+# nksr==1.0.4 --extra-index-url https://nksr.huangjh.tech/whl/torch-2.2.0+cu121.html
+#
+# # NoKSR ablation (arXiv Feb 2025; package will appear by Q2 2025).
+# git+https://github.com/yi-li/NoKSR.git@main#egg=noksr

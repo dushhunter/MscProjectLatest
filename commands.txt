@@ -8,13 +8,25 @@ python3 convert_exr_to_npy.py \
 git clone -b main https://github.com/dushhunter/MscProjectLatest/stone_syn_dataset/data_depth_annotated/train/groundtruth stone_syn_dataset/stone_01_depth_ex
 
 ###Push to github
-git add -A reconstruct_stone_3d_sparse.py
-git commit -m "Initial commit: 3d add"
-git push https://dushhunter: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@github.com/dushhunter/MscProjectLatest.git HEAD:main
+git add -A
+git commit -m "Your commit message"
+git push origin main
+# When prompted: username = dushhunter, password = GitHub PAT (not account password)
 
-###3d recons run
+### GitHub token (create/revoke)
+# Settings -> Developer settings -> Personal access tokens -> Tokens (classic)
+# Required scope: repo
+
+###3d recons run (classical sparse)
 python reconstruct_stone_3d_sparse.py \
   --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
   --intrinsics splits/stone/intrinsics.txt --sequence stone_01 \
   --width 1024 --height 576 \
   --output_dir reconstruction_output_sparse_n24
+
+###3d recons run (neural, CUDA required)
+python reconstruct_stone_3d_neural.py \
+  --depth_dir stone_syn_dataset/stone_01_sparse_npy_n18 \
+  --intrinsics splits/stone/intrinsics.txt --sequence stone_01 \
+  --device cuda \
+  --output_dir reconstruction_output_neural_n18
