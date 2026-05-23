@@ -33,8 +33,13 @@ torch==2.2.2
 # CPU-only host. Uncomment on the GPU box.
 #
 # # PointTransformerV3 backbone (segmentation).
+# # NOT pip-installable — clone and copy into a local `ptv3` package:
+# #   git clone https://github.com/Pointcept/PointTransformerV3.git /tmp/PointTransformerV3
+# #   mkdir -p ptv3 && touch ptv3/__init__.py
+# #   cp /tmp/PointTransformerV3/model.py ptv3/
+# #   cp -r /tmp/PointTransformerV3/serialization ptv3/
 # spconv-cu121==2.3.6
-# git+https://github.com/Pointcept/PointTransformerV3.git@main#egg=ptv3
+# timm einops addict
 #
 # # PARE-Net pairwise registration.
 # git+https://github.com/yaorz97/PARENet.git@main#egg=parenet
