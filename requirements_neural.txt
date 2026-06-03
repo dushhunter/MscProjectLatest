@@ -41,18 +41,46 @@ torch==2.2.2
 # spconv-cu121==2.3.6
 # timm einops addict
 #
-# # PARE-Net pairwise registration.
-# git+https://github.com/yaorz97/PARENet.git@main#egg=parenet
+# # PARE-Net pairwise registration — repo OK: https://github.com/yaorz97/PARENet
+# # Install CUDA torch FIRST. Upstream package name is ``pareconv`` (not ``parenet``):
+# #   git clone https://github.com/yaorz97/PARENet.git /tmp/PARENet && cd /tmp/PARENet
+# #   pip install -r requirements.txt && pip install .
+# # Our loader expects ``parenet.pipeline.PARENetPipeline`` — may need a project wrapper
+# # around upstream experiments/3DMatch (not a one-line pip egg).
 #
-# # GeoTransformer pairwise fallback.
-# git+https://github.com/qinzheng93/GeoTransformer.git@main#egg=geotransformer
+# # GeoTransformer pairwise fallback — repo OK: https://github.com/qinzheng93/GeoTransformer
+# # Install CUDA torch FIRST, then:
+# #   git clone https://github.com/qinzheng93/GeoTransformer.git /tmp/GeoTransformer
+# #   cd /tmp/GeoTransformer && pip install -r requirements.txt && pip install .
+# # Or: pip install git+https://github.com/qinzheng93/GeoTransformer.git@main#egg=geotransformer
+# # (builds CUDA extension; can fail without nvcc / matching torch).
 #
-# # SGHR multi-view registration (needs MinkowskiEngine).
-# git+https://github.com/NVIDIA/MinkowskiEngine.git@v0.5.4#egg=MinkowskiEngine
-# git+https://github.com/WHU-USI3DV/SGHR.git@main#egg=sghr
+# # SGHR multi-view registration — repo OK: https://github.com/WHU-USI3DV/SGHR
+# # Default branch is ``master`` (NOT main). No setup.py — NOT pip-installable as ``sghr``.
+# #   git clone https://github.com/WHU-USI3DV/SGHR.git /tmp/SGHR
+# #   cd /tmp/SGHR && pip install -r requirements.txt
+# #   export PYTHONPATH=/tmp/SGHR:$PYTHONPATH
+# # Depends on MinkowskiEngine (compile against your torch + CUDA):
+# #   git clone https://github.com/NVIDIA/MinkowskiEngine.git /tmp/MinkowskiEngine
+# #   cd /tmp/MinkowskiEngine && git checkout v0.5.4
+# #   pip install -U MinkowskiEngine -r requirements.txt --no-build-isolation
+# # Our loader expects ``sghr.solver.SGHRSolver`` — check against upstream demo/Train.py.
 #
-# # NKSR neural surface reconstruction.
-# nksr==1.0.4 --extra-index-url https://nksr.huangjh.tech/whl/torch-2.2.0+cu121.html
+# # NKSR neural surface reconstruction (NOT on PyPI; pre-built wheels expired).
+# # Official repo: https://github.com/nv-tlabs/nksr
+# # After torch 2.2.2+cu121 is installed:
+# #   git clone https://github.com/nv-tlabs/nksr.git /tmp/nksr
+# #   cd /tmp/nksr && pip install -r requirements.txt
+# #   pip install --no-build-isolation package/
+# # Optional: try a wheel index matching your exact torch build (often 503/down):
+# #   pip install nksr -f https://nksr.huangjh.tech/whl/torch-2.2.0+cu121.html
+# # Newer upstream builds target PyTorch 2.7 + CUDA 12.8 (compile from source).
 #
-# # NoKSR ablation (arXiv Feb 2025; package will appear by Q2 2025).
-# git+https://github.com/yi-li/NoKSR.git@main#egg=noksr
+# # NoKSR ablation — NOT pip-installable; wrong repo was yi-li/NoKSR (does not exist).
+# # Official repo: https://github.com/theialab/noksr
+# # Manual setup (Hydra + PyTorch3D + NKSR above):
+# #   git clone https://github.com/theialab/noksr.git /tmp/noksr
+# #   cd /tmp/noksr && pip install -r requirements.txt && pip install serial-neighbor
+# #   export PYTHONPATH=/tmp/noksr:$PYTHONPATH
+# # Checkpoints: Google Drive link in theialab/noksr README (not GitHub releases).
+# # Surface stage: use --surface_model nksr unless NoKSR loader is wired to upstream eval API.
