@@ -3,7 +3,7 @@
 Includes:
   - per-stage latency and model details
   - per-frame stone-point counts
-  - IRLS residual (when SGHR ran)
+  - RAP chamfer diagnostic (when RAP ran)
   - chamfer distance + F-score against the dense 120-frame reference mesh
 """
 
@@ -239,6 +239,8 @@ def write_neural_report(
         f.write(f"  isolated frames:     {pg_summary.get('iso_frames', [])}\n")
         if "irls_residual" in pg_summary:
             f.write(f"  irls residual:       {pg_summary['irls_residual']:.4g}\n")
+        if "rap_chamfer_d" in pg_summary:
+            f.write(f"  rap chamfer_d:       {pg_summary['rap_chamfer_d']:.4g}\n")
         f.write("\n")
 
         # -- Mesh stats -----------------------------------------------------

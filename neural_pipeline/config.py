@@ -29,7 +29,13 @@ class NeuralConfig:
     ptv3_grid_size_mm: float = 1.0
     nksr_voxel_size_mm: float = 0.5
     pare_voxel_size_mm: float = 0.6
-    sghr_voxel_size_mm: float = 0.6
+
+    # RAP multi-view registration (replaces SGHR + MinkowskiEngine).
+    rap_dir: str = "/tmp/RAP"
+    rap_voxel_size_mm: float = 0.6
+    rap_sampling_steps: int = 10
+    rap_rigidity_forcing: bool = True
+    rap_max_points_per_part: int = 500
 
     def __post_init__(self) -> None:
         if self.surface_model not in ("nksr", "noksr"):

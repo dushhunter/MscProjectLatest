@@ -1,6 +1,6 @@
 """Neural-only pipeline for depth-only stone reconstruction.
 
-Every stage runs a learned model (PointTransformerV3, PARE-Net, SGHR,
+Every stage runs a learned model (PointTransformerV3, PARE-Net, RAP,
 NKSR / NoKSR). CUDA, upstream packages, and weights under ``models/`` are
 required. Use :mod:`reconstruct_stone_3d_sparse` for the classical baseline.
 """

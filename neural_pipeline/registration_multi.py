@@ -1,4 +1,10 @@
-"""Multi-view alignment stage (SGHR only)."""
+"""Multi-view alignment stage (RAP flow-matching registration).
+
+Replaces the previous SGHR + MinkowskiEngine backend with RAP
+(Register Any Point), a single-stage flow-matching transformer that
+directly generates registered point clouds without pairwise pose
+graph synchronisation or sparse convolution dependencies.
+"""
 
 from __future__ import annotations
 
@@ -21,14 +27,14 @@ from .registration_pair import PairResult, PairwiseRegistrar
 
 LOG = logging.getLogger("stone3d_neural.multi")
 
-SGHR_WEIGHTS = "sghr_3dmatch.pth"
+RAP_WEIGHTS = "rap_model.ckpt"
 
 
 class MultiViewRegistrar:
     def __init__(self, cfg: NeuralConfig, pair_registrar: PairwiseRegistrar) -> None:
         self.cfg = cfg
         self.pair_registrar = pair_registrar
-        self._sghr = None
+        self._rap = None
 
     def solve(
         self,
@@ -41,7 +47,7 @@ class MultiViewRegistrar:
     ) -> Tuple[List[np.ndarray], dict, StageStatus]:
         require_cuda("multiview_registration")
         require_modules("multiview_registration", ["torch"])
-        require_weights("multiview_registration", SGHR_WEIGHTS, self.cfg.models_dir)
+        require_weights("multiview_registration", RAP_WEIGHTS, self.cfg.models_dir)
 
         t0 = time.time()
         poses, summary = self._solve_neural(
@@ -65,30 +71,21 @@ class MultiViewRegistrar:
         min_edge_fitness: float,
         refinement_iters: int,
     ) -> Tuple[List[np.ndarray], dict]:
-        sghr = self._get_sghr()
+        rap = self._get_rap()
         n = len(pcds_floor_up)
 
-        pair_list = []
-        for (s, t), pr in pair_results.items():
-            if pr.fitness < min_edge_fitness:
-                continue
-            pair_list.append((s, t, pr.T, pr.fitness))
-
-        if not pair_list:
-            raise RuntimeError("No pair edges above min_edge_fitness for SGHR")
-
-        T_world = sghr.solve(
+        T_world = rap.solve(
             pcds_floor_up,
-            edges=pair_list,
-            voxel_m=self.cfg.sghr_voxel_size_mm * 1e-3,
+            voxel_m=self.cfg.rap_voxel_size_mm * 1e-3,
+            max_points_per_part=self.cfg.rap_max_points_per_part,
         )
 
         summary = {
-            "method": "SGHR neural overlap + history-IRLS",
-            "edges_kept_per_iter": [len(pair_list)],
+            "method": "RAP flow-matching + Procrustes",
+            "edges_kept_per_iter": [len(pair_results)],
             "tree_edges": [],
             "iso_frames": [],
-            "irls_residual": float(getattr(sghr, "last_residual", float("nan"))),
+            "rap_chamfer_d": float(getattr(rap, "last_chamfer_d", float("nan"))),
             "n_pairs_total": n * (n - 1) // 2,
             "ambiguous": sum(1 for pr in pair_results.values() if pr.yaw_ambiguous),
         }
@@ -109,22 +106,25 @@ class MultiViewRegistrar:
             ]
             if not pair_list:
                 raise RuntimeError("All pair edges dropped below min_edge_fitness during refinement")
-            T_world = sghr.solve(
+
+            T_world = rap.solve(
                 pcds_floor_up,
-                edges=pair_list,
-                voxel_m=self.cfg.sghr_voxel_size_mm * 1e-3,
-                warm_start=T_world,
+                voxel_m=self.cfg.rap_voxel_size_mm * 1e-3,
+                max_points_per_part=self.cfg.rap_max_points_per_part,
             )
             summary["edges_kept_per_iter"].append(len(pair_list))
 
         return T_world, summary
 
-    def _get_sghr(self):
-        if self._sghr is not None:
-            return self._sghr
-        from .sghr_loader import load_sghr
-        self._sghr = load_sghr(
-            weights=f"{self.cfg.models_dir}/{SGHR_WEIGHTS}",
+    def _get_rap(self):
+        if self._rap is not None:
+            return self._rap
+        from .rap_loader import load_rap
+        self._rap = load_rap(
+            rap_dir=self.cfg.rap_dir,
+            weights=f"{self.cfg.models_dir}/{RAP_WEIGHTS}",
             device=self.cfg.torch_device(),
+            sampling_steps=self.cfg.rap_sampling_steps,
+            rigidity_forcing=self.cfg.rap_rigidity_forcing,
         )
-        return self._sghr
+        return self._rap
