@@ -4,7 +4,7 @@
 #   profile_cpu : everything except the GPU-only neural backbones. Lets
 #                 reconstruct_stone_3d_neural.py run in `auto` mode which
 #                 transparently falls back to the classical pipeline.
-#   profile_gpu : adds PARE-Net, SGHR, NKSR, NoKSR, PointTransformerV3
+#   profile_gpu : adds PARE-Net, RAP, NKSR, NoKSR, PointTransformerV3
 #                 (all of which require a CUDA toolchain to compile).
 #
 # Pinned versions are tested against CUDA 12.1 + PyTorch 2.2.2.
@@ -55,16 +55,20 @@ torch==2.2.2
 # # Or: pip install git+https://github.com/qinzheng93/GeoTransformer.git@main#egg=geotransformer
 # # (builds CUDA extension; can fail without nvcc / matching torch).
 #
-# # SGHR multi-view registration — repo OK: https://github.com/WHU-USI3DV/SGHR
-# # Default branch is ``master`` (NOT main). No setup.py — NOT pip-installable as ``sghr``.
-# #   git clone https://github.com/WHU-USI3DV/SGHR.git /tmp/SGHR
-# #   cd /tmp/SGHR && pip install -r requirements.txt
-# #   export PYTHONPATH=/tmp/SGHR:$PYTHONPATH
-# # Depends on MinkowskiEngine (compile against your torch + CUDA):
-# #   git clone https://github.com/NVIDIA/MinkowskiEngine.git /tmp/MinkowskiEngine
-# #   cd /tmp/MinkowskiEngine && git checkout v0.5.4
-# #   pip install -U MinkowskiEngine -r requirements.txt --no-build-isolation
-# # Our loader expects ``sghr.solver.SGHRSolver`` — check against upstream demo/Train.py.
+# # RAP multi-view registration (replaces SGHR + MinkowskiEngine).
+# # Pure PyTorch transformer + flow matching — NO sparse-conv dependency.
+# # Repo: https://github.com/PRBonn/RAP  (MIT licence)
+# # Reference: Pan et al., NeurIPS 2025.
+# #   git clone https://github.com/PRBonn/RAP.git /tmp/RAP
+# #   cd /tmp/RAP
+# #   conda create -n py310-rap python=3.10 -y && conda activate py310-rap
+# #   bash ./scripts/install.sh          # installs torch, hydra, etc.
+# #   bash ./scripts/download_weights_and_demo_data.sh
+# #   cp weights/rap_model.ckpt <your_models_dir>/rap_model.ckpt
+# # Extra pip deps (most already pulled by install.sh):
+# hydra-core>=1.3
+# lightning>=2.0
+# natsort
 #
 # # NKSR neural surface reconstruction (NOT on PyPI; pre-built wheels expired).
 # # Official repo: https://github.com/nv-tlabs/nksr

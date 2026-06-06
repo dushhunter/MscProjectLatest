@@ -12,7 +12,7 @@ Pipeline:
   3. Floor plane fit on PTv3 floor points + floor-up Rodrigues transform.
   4. Per-frame stone point-cloud extraction in the floor-up frame.
   5. Pairwise registration (PARE-Net + ICP; GeoTransformer if a pair fails).
-  6. Multi-view alignment (SGHR neural overlap + history-IRLS).
+  6. Multi-view alignment (RAP flow-matching + Procrustes).
   7. Surface reconstruction (NKSR or NoKSR).
   8. Watertight closure if the neural mesh has a floor-side hole.
   9. Optional chamfer / F-score against a dense reference mesh.
@@ -21,7 +21,7 @@ References (2024-2026):
   - PointTransformerV3 (Wu et al., CVPR 2024).
   - PARE-Net (Yao et al., ECCV 2024).
   - GeoTransformer (Qin et al., PAMI 2023).
-  - SGHR (Wang et al., CVPR 2023).
+  - RAP (Pan et al., NeurIPS 2025).
   - NKSR (Huang et al., CVPR 2023 Highlight).
   - NoKSR (Yi et al., arXiv 2025).
 """
