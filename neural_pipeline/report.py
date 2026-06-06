@@ -19,8 +19,7 @@ import numpy as np
 import open3d as o3d
 
 from .config import NeuralConfig, StageStatus
-from reconstruct_stone_3d import Intrinsics  # noqa: E402
-from reconstruct_stone_3d_sparse import FloorFit  # noqa: E402
+from .geometry import Intrinsics, FloorFit
 
 
 LOG = logging.getLogger("stone3d_neural.report")

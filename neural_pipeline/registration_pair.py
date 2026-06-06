@@ -20,8 +20,9 @@ from .config import (
 import os
 os.environ.setdefault("OPEN3D_DISABLE_WEB_VISUALIZER", "1")
 import open3d as o3d  # noqa: E402
-from reconstruct_stone_3d_sparse import (  # noqa: E402
-    PairResult as ClassicalPairResult,
+
+from .geometry import (  # noqa: E402
+    PairResult,
     _refine_pair_from_init,
     _multi_stage_icp,
     _yaw_only,
@@ -30,8 +31,6 @@ from reconstruct_stone_3d_sparse import (  # noqa: E402
 
 
 LOG = logging.getLogger("stone3d_neural.pair")
-
-PairResult = ClassicalPairResult
 
 PARE_WEIGHTS = "parenet_3dmatch.pth"
 GEOTR_WEIGHTS = "geotransformer_3dmatch.pth"

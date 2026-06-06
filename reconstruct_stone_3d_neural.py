@@ -40,13 +40,9 @@ import numpy as np
 os.environ.setdefault("OPEN3D_DISABLE_WEB_VISUALIZER", "1")
 import open3d as o3d  # noqa: E402
 
-from reconstruct_stone_3d import (  # noqa: E402
+from neural_pipeline.geometry import (  # noqa: E402
     Intrinsics, load_intrinsics, make_pcd, merge_pointclouds, render_preview,
-)
-from reconstruct_stone_3d_sparse import (  # noqa: E402
-    floor_up_transform,
-    load_depth_only_frames,
-    write_segmentation_preview,
+    floor_up_transform, load_depth_only_frames, write_segmentation_preview,
 )
 from neural_pipeline import (  # noqa: E402
     NeuralConfig,

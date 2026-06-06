@@ -18,8 +18,7 @@ from .config import (
     require_weights,
 )
 
-from reconstruct_stone_3d import Frame, Intrinsics, make_watertight_mesh  # noqa: E402
-from reconstruct_stone_3d_sparse import keep_components_above  # noqa: E402
+from .geometry import Frame, Intrinsics, make_watertight_mesh, keep_components_above
 
 
 LOG = logging.getLogger("stone3d_neural.surface")

@@ -27,7 +27,7 @@ from .registration_pair import PairResult, PairwiseRegistrar
 
 LOG = logging.getLogger("stone3d_neural.multi")
 
-RAP_WEIGHTS = "rap_model.ckpt"
+RAP_WEIGHTS = "rap_model_10.ckpt"
 
 
 class MultiViewRegistrar:

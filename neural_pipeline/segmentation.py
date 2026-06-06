@@ -17,14 +17,9 @@ from .config import (
     require_weights,
 )
 
-LOG = logging.getLogger("stone3d_neural.seg")
+from .geometry import Frame, Intrinsics, FloorFit, _backproject_full, _fit_floor_plane
 
-from reconstruct_stone_3d import Frame, Intrinsics  # noqa: E402
-from reconstruct_stone_3d_sparse import (  # noqa: E402
-    FloorFit,
-    _backproject_full,
-    _fit_floor_plane,
-)
+LOG = logging.getLogger("stone3d_neural.seg")
 
 
 PTV3_WEIGHTS = "ptv3_stone_binary.pth"
