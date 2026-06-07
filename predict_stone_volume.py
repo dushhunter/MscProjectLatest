@@ -59,6 +59,7 @@ from neural_pipeline.geometry import (  # noqa: E402
     make_pcd,
 )
 from volume_estimation.model import StoneReconNet, StoneReconNetConfig  # noqa: E402
+from volume_estimation.prepare_gt import _turntable_rotation_y  # noqa: E402
 
 LOG = logging.getLogger("predict_stone_volume")
 
@@ -85,6 +86,13 @@ def _load_poses_for_inference(depth_dir: str) -> Optional[Dict[int, np.ndarray]]
     return {int(k): np.array(v, dtype=np.float64) for k, v in data.items()}
 
 
+def _extract_frame_index(filepath: str) -> int:
+    """Extract the numeric frame index from a depth filename like depth_0042.npy."""
+    stem = Path(filepath).stem
+    digits = "".join(c for c in stem if c.isdigit())
+    return int(digits) if digits else 0
+
+
 def _prepare_input(
     depth_files: List[str],
     intrinsics: Intrinsics,
@@ -92,8 +100,13 @@ def _prepare_input(
     device: str = "cuda",
     random_depth_files: Optional[List[str]] = None,
     random_poses: Optional[Dict[int, np.ndarray]] = None,
+    angle_per_frame_deg: float = 3.0,
 ) -> Tuple[Dict[str, torch.Tensor], np.ndarray, int, int]:
-    """Load depth files, back-project, and prepare model input.
+    """Load depth files, back-project, apply poses, and prepare model input.
+
+    Turntable views get the analytical Y-rotation (matching training).
+    Random views get the explicit 4x4 pose from poses.json.
+    This ensures the input distribution matches what the model saw in training.
 
     Returns:
         batch: Model input dict.
@@ -116,6 +129,12 @@ def _prepare_input(
             continue
 
         pts = pts_cam.astype(np.float32)
+
+        frame_idx = _extract_frame_index(path)
+        T = _turntable_rotation_y(frame_idx, angle_per_frame_deg)
+        R = T[:3, :3].astype(np.float32)
+        pts = (R @ pts.T).T
+
         if pts.shape[0] > max_points_per_view:
             choice = np.random.choice(pts.shape[0], max_points_per_view, replace=False)
             pts = pts[choice]
@@ -140,6 +159,17 @@ def _prepare_input(
                 continue
 
             pts = pts_cam.astype(np.float32)
+
+            frame_idx = _extract_frame_index(path)
+            if random_poses and frame_idx in random_poses:
+                pose = random_poses[frame_idx]
+                R = pose[:3, :3].astype(np.float32)
+                t = pose[:3, 3].astype(np.float32)
+                pts = (R @ pts.T).T + t
+            else:
+                LOG.warning("No pose for random view %s (frame %d) -- using raw camera space",
+                            path, frame_idx)
+
             if pts.shape[0] > max_points_per_view:
                 choice = np.random.choice(pts.shape[0], max_points_per_view, replace=False)
                 pts = pts[choice]
