@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""Predict stone volume from sparse depth maps using a trained StoneVolumeNet.
+"""Predict stone volume from sparse depth maps using StoneReconNet.
 
-Supports two registration modes:
-  - Direct: segmentation + volume head (fast, single forward pass)
-  - RPF Flow: Euler ODE integration for flow-based registration (from RPF)
+Pipeline:
+  1. Model segments stone points and registers them via RPF flow (Euler ODE).
+  2. Poisson surface reconstruction creates a watertight mesh from the
+     registered stone point cloud.
+  3. Volume is computed geometrically from the mesh.
+
+No neural volume regression -- all volume computation is geometric.
 
 Usage:
     python predict_stone_volume.py \
         --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
         --intrinsics splits/stone/intrinsics.txt \
         --sequence stone_01 \
-        --checkpoint models/stone_volume_net.pt \
+        --checkpoint models/stone_recon_net.pt \
         --output_dir volume_output/ \
-        --use_flow --flow_steps 10
+        --flow_steps 10
 
 Output:
-    - stone_pointcloud.ply         (segmented registered point cloud)
-    - flow_registered.ply          (RPF flow-registered point cloud, if --use_flow)
-    - volume_report.txt            (predicted volume and statistics)
+    - stone_registered.ply        (registered stone point cloud)
+    - stone_mesh.ply              (watertight Poisson mesh)
+    - volume_report.txt           (geometric volume and statistics)
+    - prediction_result.json      (machine-readable results)
 """
 
 from __future__ import annotations
@@ -25,12 +30,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -44,7 +48,7 @@ from neural_pipeline.geometry import (  # noqa: E402
     load_intrinsics,
     make_pcd,
 )
-from volume_estimation.model import StoneVolumeNet, StoneVolumeNetConfig  # noqa: E402
+from volume_estimation.model import StoneReconNet, StoneReconNetConfig  # noqa: E402
 
 LOG = logging.getLogger("predict_stone_volume")
 
@@ -66,7 +70,7 @@ def _prepare_input(
     intrinsics: Intrinsics,
     max_points_per_view: int = 4096,
     device: str = "cuda",
-) -> Dict[str, torch.Tensor]:
+) -> Tuple[Dict[str, torch.Tensor], np.ndarray]:
     """Load depth files, back-project, and prepare model input."""
     all_pts = []
     all_view_ids = []
@@ -111,52 +115,133 @@ def _prepare_input(
     return batch, centroid
 
 
+def poisson_mesh(
+    points: np.ndarray,
+    depth: int = 9,
+    density_quantile: float = 0.01,
+) -> Tuple[o3d.geometry.TriangleMesh, o3d.geometry.PointCloud]:
+    """Poisson surface reconstruction from a point cloud.
+
+    Args:
+        points: (N, 3) point positions.
+        depth: Octree depth for Poisson reconstruction (higher = finer detail).
+        density_quantile: Remove low-density vertices (trims outlier geometry).
+
+    Returns:
+        mesh: Triangle mesh (watertight when possible).
+        pcd: Point cloud with estimated normals (used for reconstruction).
+    """
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=30)
+    )
+    pcd.orient_normals_towards_camera_location(
+        camera_location=np.array(points.mean(axis=0), dtype=np.float64)
+    )
+    # Flip normals to point outward (orient_normals_towards_camera puts them
+    # toward the centroid, so we invert)
+    pcd.normals = o3d.utility.Vector3dVector(-np.asarray(pcd.normals))
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, linear_fit=True,
+    )
+
+    densities = np.asarray(densities)
+    threshold = np.quantile(densities, density_quantile)
+    vertices_to_remove = densities < threshold
+    mesh.remove_vertices_by_mask(vertices_to_remove)
+
+    mesh.compute_vertex_normals()
+
+    return mesh, pcd
+
+
+def _mesh_volume_safe(mesh: o3d.geometry.TriangleMesh) -> float:
+    """Compute mesh volume, returning 0 if the mesh is not watertight."""
+    if mesh.is_watertight():
+        return abs(mesh.get_volume())
+
+    LOG.warning("Mesh is not watertight; attempting to close holes")
+    mesh_copy = o3d.geometry.TriangleMesh(mesh)
+    mesh_copy = mesh_copy.remove_degenerate_triangles()
+    mesh_copy = mesh_copy.remove_duplicated_triangles()
+    mesh_copy = mesh_copy.remove_duplicated_vertices()
+    mesh_copy = mesh_copy.remove_non_manifold_edges()
+
+    if mesh_copy.is_watertight():
+        return abs(mesh_copy.get_volume())
+
+    LOG.warning("Could not make mesh watertight; estimating volume from convex hull")
+    try:
+        hull, _ = mesh_copy.compute_convex_hull()
+        if hull.is_watertight():
+            return abs(hull.get_volume())
+    except Exception:
+        pass
+
+    return 0.0
+
+
 @torch.no_grad()
 def predict(
-    model: StoneVolumeNet,
+    model: StoneReconNet,
     batch: Dict[str, torch.Tensor],
     centroid: np.ndarray,
-    use_flow: bool = False,
     flow_steps: int = 10,
+    poisson_depth: int = 9,
 ) -> Dict:
-    """Run inference with optional RPF flow-based Euler ODE registration.
+    """Full inference: segment -> RPF registration -> Poisson mesh -> volume.
 
-    When use_flow=True, runs Euler ODE integration from t=1 (noise) to t=0
-    to produce a flow-registered point cloud alongside the direct prediction.
+    Returns dict with registered points, mesh, and geometric volume.
     """
     model.eval()
 
-    output = model.forward_inference(batch)
+    registered_pts, seg_logits = model.sample_rectified_flow(
+        batch, num_steps=flow_steps,
+    )
 
-    pred_volume = float(output["pred_volume"].item())
+    seg_probs = torch.sigmoid(seg_logits[0]).cpu().numpy()
+    stone_mask_full = seg_probs > 0.5
 
-    points = batch["points"][0].cpu().numpy()
-    seg_probs = torch.sigmoid(output["seg_logits"][0]).cpu().numpy()
-    stone_mask = seg_probs > 0.5
+    flow_pts = registered_pts[0].cpu().numpy()
 
-    stone_pts = points[stone_mask] + centroid
-    all_pts = points + centroid
+    input_pts = batch["points"][0].cpu().numpy()
+    stone_pts_input = input_pts[stone_mask_full] + centroid
 
-    n_stone = int(stone_mask.sum())
-    n_total = points.shape[0]
+    n_stone = int(stone_mask_full.sum())
+    n_total = input_pts.shape[0]
     seg_ratio = n_stone / max(n_total, 1)
 
     results = {
-        "pred_volume_cm3": pred_volume,
-        "pred_volume_mm3": pred_volume * 1000.0,
-        "stone_points": stone_pts,
-        "all_points": all_pts,
+        "flow_registered_points": flow_pts,
+        "stone_points_input": stone_pts_input,
         "seg_probs": seg_probs,
         "n_stone_points": n_stone,
         "n_total_points": n_total,
+        "n_flow_points": flow_pts.shape[0],
         "seg_ratio": seg_ratio,
+        "flow_steps": flow_steps,
     }
 
-    if use_flow:
-        registered = model.sample_rectified_flow(batch, num_steps=flow_steps)
-        flow_pts = registered[0].cpu().numpy() + centroid
-        results["flow_registered_points"] = flow_pts
-        results["flow_steps"] = flow_steps
+    if flow_pts.shape[0] < 100:
+        LOG.warning("Too few registered points (%d) for mesh reconstruction", flow_pts.shape[0])
+        results["volume_cm3"] = 0.0
+        results["volume_mm3"] = 0.0
+        results["mesh"] = None
+        return results
+
+    mesh, pcd = poisson_mesh(flow_pts, depth=poisson_depth)
+
+    volume_cm3 = _mesh_volume_safe(mesh)
+
+    results["volume_cm3"] = volume_cm3
+    results["volume_mm3"] = volume_cm3 * 1000.0
+    results["mesh"] = mesh
+    results["mesh_vertices"] = len(mesh.vertices)
+    results["mesh_triangles"] = len(mesh.triangles)
+    results["mesh_watertight"] = mesh.is_watertight()
 
     return results
 
@@ -168,58 +253,68 @@ def save_results(
     n_views: int,
     elapsed_s: float,
 ):
-    """Save point cloud(s) and text report."""
+    """Save mesh, point cloud(s), and reports."""
     os.makedirs(output_dir, exist_ok=True)
 
-    stone_pts = results["stone_points"]
-    if stone_pts.shape[0] > 0:
-        pcd = make_pcd(stone_pts, estimate_normals=True)
-        ply_path = os.path.join(output_dir, "stone_pointcloud.ply")
+    flow_pts = results["flow_registered_points"]
+    if flow_pts.shape[0] > 0:
+        pcd = make_pcd(flow_pts, estimate_normals=True)
+        ply_path = os.path.join(output_dir, "stone_registered.ply")
         o3d.io.write_point_cloud(ply_path, pcd)
-        LOG.info("Saved point cloud: %s (%d points)", ply_path, stone_pts.shape[0])
+        LOG.info("Saved registered cloud: %s (%d pts)", ply_path, flow_pts.shape[0])
 
-    all_pcd = make_pcd(results["all_points"], estimate_normals=False)
-    all_ply = os.path.join(output_dir, "full_pointcloud.ply")
-    o3d.io.write_point_cloud(all_ply, all_pcd)
+    stone_pts = results["stone_points_input"]
+    if stone_pts.shape[0] > 0:
+        stone_pcd = make_pcd(stone_pts, estimate_normals=True)
+        stone_ply = os.path.join(output_dir, "stone_segmented.ply")
+        o3d.io.write_point_cloud(stone_ply, stone_pcd)
 
-    if "flow_registered_points" in results:
-        flow_pts = results["flow_registered_points"]
-        if flow_pts.shape[0] > 0:
-            flow_pcd = make_pcd(flow_pts, estimate_normals=True)
-            flow_ply = os.path.join(output_dir, "flow_registered.ply")
-            o3d.io.write_point_cloud(flow_ply, flow_pcd)
-            LOG.info("Saved flow-registered cloud: %s (%d pts)", flow_ply, flow_pts.shape[0])
+    mesh = results.get("mesh")
+    if mesh is not None:
+        mesh_path = os.path.join(output_dir, "stone_mesh.ply")
+        o3d.io.write_triangle_mesh(mesh_path, mesh)
+        LOG.info("Saved mesh: %s (%d vertices, %d triangles)",
+                 mesh_path, len(mesh.vertices), len(mesh.triangles))
 
     report_lines = [
         "=" * 60,
-        "StoneVolumeNet — Prediction Report",
+        "StoneReconNet -- Volume Prediction Report",
         "=" * 60,
         "",
         f"Input:            {depth_dir}",
         f"Views:            {n_views}",
         f"Total points:     {results['n_total_points']}",
         f"Stone points:     {results['n_stone_points']} ({results['seg_ratio']:.1%})",
+        f"Flow points:      {results['n_flow_points']}",
+        f"Flow ODE steps:   {results['flow_steps']}",
         "",
-        f"Predicted Volume: {results['pred_volume_cm3']:.6f} cm³",
-        f"                  {results['pred_volume_mm3']:.2f} mm³",
+        "--- Mesh Reconstruction ---",
+    ]
+
+    if mesh is not None:
+        report_lines += [
+            f"Mesh vertices:    {results['mesh_vertices']}",
+            f"Mesh triangles:   {results['mesh_triangles']}",
+            f"Watertight:       {results['mesh_watertight']}",
+            "",
+            f"Volume:           {results['volume_cm3']:.6f} cm3",
+            f"                  {results['volume_mm3']:.2f} mm3",
+        ]
+    else:
+        report_lines.append("Mesh: FAILED (too few points)")
+
+    report_lines += [
         "",
         f"Inference time:   {elapsed_s:.3f} s",
-    ]
-
-    if "flow_steps" in results:
-        report_lines.append(f"Flow ODE steps:   {results['flow_steps']}")
-        report_lines.append(f"Flow points:      {results['flow_registered_points'].shape[0]}")
-
-    report_lines += [
         "",
         "Output files:",
-        f"  Point cloud:    stone_pointcloud.ply",
-        f"  Full cloud:     full_pointcloud.ply",
+        "  Registered PC:  stone_registered.ply",
+        "  Segmented PC:   stone_segmented.ply",
     ]
-    if "flow_registered_points" in results:
-        report_lines.append(f"  Flow cloud:     flow_registered.ply")
+    if mesh is not None:
+        report_lines.append("  Mesh:           stone_mesh.ply")
     report_lines += [
-        f"  Report:         volume_report.txt",
+        "  Report:         volume_report.txt",
         "=" * 60,
     ]
 
@@ -232,25 +327,29 @@ def save_results(
         print(line)
 
     result_json = {
-        "pred_volume_cm3": results["pred_volume_cm3"],
-        "pred_volume_mm3": results["pred_volume_mm3"],
+        "volume_cm3": results["volume_cm3"],
+        "volume_mm3": results["volume_mm3"],
         "n_stone_points": results["n_stone_points"],
         "n_total_points": results["n_total_points"],
+        "n_flow_points": results["n_flow_points"],
         "seg_ratio": results["seg_ratio"],
+        "flow_steps": results["flow_steps"],
         "n_views": n_views,
         "inference_time_s": elapsed_s,
         "input_dir": depth_dir,
     }
-    if "flow_steps" in results:
-        result_json["flow_steps"] = results["flow_steps"]
-        result_json["flow_registered_n_points"] = int(results["flow_registered_points"].shape[0])
+    if mesh is not None:
+        result_json["mesh_vertices"] = results["mesh_vertices"]
+        result_json["mesh_triangles"] = results["mesh_triangles"]
+        result_json["mesh_watertight"] = results["mesh_watertight"]
+
     with open(os.path.join(output_dir, "prediction_result.json"), "w") as f:
         json.dump(result_json, f, indent=2)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Predict stone volume from sparse depth maps"
+        description="Predict stone volume: neural segmentation + RPF flow registration + Poisson mesh"
     )
     parser.add_argument("--depth_dir", required=True,
                         help="Directory with sparse .npy depth files")
@@ -266,17 +365,17 @@ def main():
     parser.add_argument("--height", type=int, default=576)
     parser.add_argument("--max_points_per_view", type=int, default=4096)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--use_flow", action="store_true",
-                        help="Use RPF Euler ODE integration for flow-based registration")
     parser.add_argument("--flow_steps", type=int, default=10,
-                        help="Number of Euler ODE steps for flow registration")
+                        help="Number of Euler ODE steps for RPF flow registration")
+    parser.add_argument("--poisson_depth", type=int, default=9,
+                        help="Octree depth for Poisson surface reconstruction")
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
 
     LOG.info("Loading model from %s", args.checkpoint)
-    cfg = StoneVolumeNetConfig()
-    model = StoneVolumeNet(cfg)
+    cfg = StoneReconNetConfig()
+    model = StoneReconNet(cfg)
 
     state = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
     model.load_state_dict(state)
@@ -296,13 +395,12 @@ def main():
         device=args.device,
     )
 
-    mode = "RPF flow registration" if args.use_flow else "direct"
-    LOG.info("Running inference (%s)...", mode)
+    LOG.info("Running inference (RPF flow + Poisson mesh)...")
     t0 = time.perf_counter()
     results = predict(
         model, batch, centroid,
-        use_flow=args.use_flow,
         flow_steps=args.flow_steps,
+        poisson_depth=args.poisson_depth,
     )
     elapsed = time.perf_counter() - t0
 

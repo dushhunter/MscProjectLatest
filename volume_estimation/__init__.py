@@ -1,1 +1,1 @@
-"""End-to-end stone volume estimation via learned 3D reconstruction."""
+"""Neural stone segmentation and registration for geometric volume estimation."""

@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
-"""PyTorch Lightning training for StoneVolumeNet with RPF flow registration.
+"""PyTorch Lightning training for StoneReconNet.
 
 Follows RPF's (Rectified Point Flow) training pattern:
   forward() -> loss() -> training_step() -> validation_step()
 
+Training objectives (no direct volume regression):
+  - BCE segmentation loss  (stone vs floor/background)
+  - MSE flow velocity loss (RPF rectified flow registration)
+
+Volume is NOT predicted by the network. At inference time, the registered
+point cloud is turned into a watertight mesh via Poisson reconstruction,
+and volume is computed geometrically from the mesh.
+
 Supports:
-  - Rectified flow velocity field learning alongside segmentation + volume
+  - Rectified flow velocity field learning alongside segmentation
   - Train/val split (stones 1-10 train, 11-12 val) or leave-one-out CV
   - OneCycleLR scheduler with AdamW
   - Mixed precision (fp16) for RTX 4080 16GB
   - tf32 + cudnn.benchmark CUDA optimizations (from RPF)
   - Frozen encoder support (from RPF)
-  - wandb and/or MLflow logging
-  - Automatic checkpointing on best validation volume MAE
+  - wandb and/or TensorBoard logging
+  - Automatic checkpointing on best validation loss
 """
 
 from __future__ import annotations
@@ -47,13 +55,13 @@ except ImportError:
     )
 
 from volume_estimation.dataset import (
-    StoneVolumeDataset,
+    StoneReconDataset,
     collate_variable_points,
 )
-from volume_estimation.loss import LossWeights, StoneVolumeLoss
-from volume_estimation.model import StoneVolumeNet, StoneVolumeNetConfig
+from volume_estimation.loss import LossWeights, StoneReconLoss
+from volume_estimation.model import StoneReconNet, StoneReconNetConfig
 
-LOG = logging.getLogger("train_stone_volume")
+LOG = logging.getLogger("train_stone_recon")
 
 
 def _enable_cuda_optimizations():
@@ -64,19 +72,16 @@ def _enable_cuda_optimizations():
         torch.backends.cudnn.benchmark = True
 
 
-class StoneVolumeLightning(pl.LightningModule):
+class StoneReconLightning(pl.LightningModule):
     """Lightning wrapper following RPF's forward/loss/training_step pattern.
 
-    The structure mirrors RPF's RectifiedPointFlow LightningModule:
-      - forward() runs the model and returns the full output dict
-      - loss() computes all loss terms from the output
-      - training_step() calls forward() then loss() then logs
-      - validation_step() adds flow registration evaluation
+    Training objectives: segmentation BCE + flow velocity MSE.
+    No volume regression -- volume is computed from the mesh at inference.
     """
 
     def __init__(
         self,
-        model_cfg: StoneVolumeNetConfig,
+        model_cfg: StoneReconNetConfig,
         loss_weights: LossWeights,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
@@ -85,8 +90,8 @@ class StoneVolumeLightning(pl.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        self.model = StoneVolumeNet(model_cfg)
-        self.criterion = StoneVolumeLoss(loss_weights)
+        self.model = StoneReconNet(model_cfg)
+        self.criterion = StoneReconLoss(loss_weights)
         self.lr = lr
         self.weight_decay = weight_decay
         self.max_epochs = max_epochs
@@ -97,7 +102,6 @@ class StoneVolumeLightning(pl.LightningModule):
     # ------------------------------------------------------------------
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Run the model forward pass (RPF pattern: forward returns all outputs)."""
         return self.model(batch)
 
     def loss(
@@ -105,11 +109,9 @@ class StoneVolumeLightning(pl.LightningModule):
         output: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Compute all loss terms (RPF pattern: separate loss method)."""
         return self.criterion(output, batch)
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        """RPF pattern: forward() -> loss() -> log."""
         output = self.forward(batch)
         losses = self.loss(output, batch)
 
@@ -120,34 +122,19 @@ class StoneVolumeLightning(pl.LightningModule):
         return losses["loss"]
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        """RPF pattern: forward() -> loss() -> log + flow registration eval."""
         output = self.forward(batch)
         losses = self.loss(output, batch)
 
         B = batch["points"].shape[0]
         for k, v in losses.items():
-            self.log(f"val/{k}", v, prog_bar=(k in ("loss", "vol_mae")),
+            self.log(f"val/{k}", v, prog_bar=(k == "loss"),
                      batch_size=B, sync_dist=True)
-
-        pred = output["pred_volume"]
-        gt = batch["gt_volume"]
-        self.log("val/vol_r2", self._r2_score(pred, gt),
-                 batch_size=B, sync_dist=True)
-
-        seg_probs = torch.sigmoid(output["seg_logits"])
-        valid = ~batch["pad_mask"]
-        pred_seg = (seg_probs > 0.5).float()
-        correct = ((pred_seg == batch["seg_labels"]) & valid).sum()
-        total = valid.sum().clamp(min=1)
-        self.log("val/seg_acc", correct.float() / total.float(),
-                 batch_size=B, sync_dist=True)
 
     # ------------------------------------------------------------------
     # RPF-style hooks for frozen encoder
     # ------------------------------------------------------------------
 
     def on_train_epoch_start(self) -> None:
-        """Freeze encoder after specified epoch (RPF frozen encoder support)."""
         if (
             self.freeze_encoder_after >= 0
             and self.current_epoch >= self.freeze_encoder_after
@@ -155,7 +142,6 @@ class StoneVolumeLightning(pl.LightningModule):
             self.model.freeze_encoder()
 
     def on_validation_epoch_start(self) -> None:
-        """Ensure encoder stays frozen during validation if applicable."""
         if (
             self.freeze_encoder_after >= 0
             and self.current_epoch >= self.freeze_encoder_after
@@ -163,14 +149,8 @@ class StoneVolumeLightning(pl.LightningModule):
             self.model.freeze_encoder()
 
     # ------------------------------------------------------------------
-    # Utilities
+    # Optimizer
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _r2_score(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        ss_res = ((pred - target) ** 2).sum()
-        ss_tot = ((target - target.mean()) ** 2).sum().clamp(min=1e-8)
-        return 1.0 - ss_res / ss_tot
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -193,7 +173,7 @@ class StoneVolumeLightning(pl.LightningModule):
 
 def build_datasets(
     dataset_dir: str,
-    volumes_json: str,
+    volumes_json: Optional[str],
     intrinsics_path: str,
     train_stones: List[str],
     val_stones: List[str],
@@ -203,7 +183,7 @@ def build_datasets(
     train_samples_per_epoch: int = 500,
     val_samples_per_epoch: int = 100,
 ) -> tuple:
-    train_ds = StoneVolumeDataset(
+    train_ds = StoneReconDataset(
         dataset_dir=dataset_dir,
         volumes_json=volumes_json,
         intrinsics_path=intrinsics_path,
@@ -214,7 +194,7 @@ def build_datasets(
         augment=True,
         samples_per_epoch=train_samples_per_epoch,
     )
-    val_ds = StoneVolumeDataset(
+    val_ds = StoneReconDataset(
         dataset_dir=dataset_dir,
         volumes_json=volumes_json,
         intrinsics_path=intrinsics_path,
@@ -262,12 +242,8 @@ def train(
     num_workers: int = 4,
     precision: str = "16-mixed",
     use_wandb: bool = False,
-    wandb_project: str = "stone-volume",
-    use_mlflow: bool = False,
-    mlflow_experiment: str = "stone-volume",
+    wandb_project: str = "stone-recon",
     loss_w_seg: float = 1.0,
-    loss_w_volume: float = 0.1,
-    loss_w_mape: float = 0.05,
     loss_w_flow: float = 1.0,
     patience: int = 30,
     width: int = 1024,
@@ -308,13 +284,10 @@ def train(
         pin_memory=True, persistent_workers=num_workers > 0,
     )
 
-    model_cfg = StoneVolumeNetConfig()
-    loss_weights = LossWeights(
-        seg=loss_w_seg, volume=loss_w_volume,
-        mape=loss_w_mape, flow=loss_w_flow,
-    )
+    model_cfg = StoneReconNetConfig()
+    loss_weights = LossWeights(seg=loss_w_seg, flow=loss_w_flow)
 
-    lit_model = StoneVolumeLightning(
+    lit_model = StoneReconLightning(
         model_cfg=model_cfg,
         loss_weights=loss_weights,
         lr=lr,
@@ -325,21 +298,21 @@ def train(
 
     param_counts = lit_model.model.count_parameters()
     LOG.info("Model parameters: %s", param_counts)
-    LOG.info("Flow loss weight: %.3f", loss_w_flow)
+    LOG.info("Loss weights -- seg: %.3f, flow: %.3f", loss_w_seg, loss_w_flow)
     if freeze_encoder_after >= 0:
         LOG.info("Encoder freezes after epoch %d", freeze_encoder_after)
 
     callbacks = [
         ModelCheckpoint(
             dirpath=os.path.join(output_dir, "checkpoints"),
-            filename="best-{epoch:03d}-{val/vol_mae:.4f}",
-            monitor="val/vol_mae",
+            filename="best-{epoch:03d}-{val/loss:.4f}",
+            monitor="val/loss",
             mode="min",
             save_top_k=3,
             save_last=True,
         ),
         EarlyStopping(
-            monitor="val/vol_mae",
+            monitor="val/loss",
             mode="min",
             patience=patience,
             verbose=True,
@@ -355,17 +328,8 @@ def train(
             from lightning.pytorch.loggers import WandbLogger
         loggers.append(WandbLogger(
             project=wandb_project,
-            name=f"stone_vol_{len(train_stones)}train",
+            name=f"stone_recon_{len(train_stones)}train",
             save_dir=output_dir,
-        ))
-    if use_mlflow:
-        try:
-            from pytorch_lightning.loggers import MLFlowLogger
-        except ImportError:
-            from lightning.pytorch.loggers import MLFlowLogger
-        loggers.append(MLFlowLogger(
-            experiment_name=mlflow_experiment,
-            tracking_uri=os.path.join(output_dir, "mlruns"),
         ))
     if not loggers:
         try:
@@ -394,9 +358,9 @@ def train(
     best_ckpt = callbacks[0].best_model_path
     LOG.info("Best checkpoint: %s", best_ckpt)
 
-    final_path = os.path.join(output_dir, "stone_volume_net.pt")
+    final_path = os.path.join(output_dir, "stone_recon_net.pt")
     if best_ckpt and os.path.exists(best_ckpt):
-        best = StoneVolumeLightning.load_from_checkpoint(best_ckpt)
+        best = StoneReconLightning.load_from_checkpoint(best_ckpt)
         torch.save(best.model.state_dict(), final_path)
         LOG.info("Saved final model weights: %s", final_path)
 
@@ -407,7 +371,8 @@ def train(
         "model_params": param_counts,
         "max_epochs": max_epochs,
         "lr": lr,
-        "flow_loss_weight": loss_w_flow,
+        "loss_w_seg": loss_w_seg,
+        "loss_w_flow": loss_w_flow,
         "freeze_encoder_after": freeze_encoder_after,
     }
     with open(os.path.join(output_dir, "training_summary.json"), "w") as f:
@@ -417,11 +382,11 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train StoneVolumeNet")
+    parser = argparse.ArgumentParser(description="Train StoneReconNet")
     parser.add_argument("--dataset_dir", required=True,
                         help="Root of stone_syn_dataset/")
     parser.add_argument("--volumes_json", required=True,
-                        help="Path to stone_volumes_gt.json from prepare_gt.py")
+                        help="Path to stone_volumes_gt.json")
     parser.add_argument("--intrinsics", required=True,
                         help="Path to intrinsics.txt")
     parser.add_argument("--output_dir", default="volume_training_output",
@@ -443,9 +408,8 @@ def main():
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=576)
 
-    parser.add_argument("--loss_w_seg", type=float, default=1.0)
-    parser.add_argument("--loss_w_volume", type=float, default=0.1)
-    parser.add_argument("--loss_w_mape", type=float, default=0.05)
+    parser.add_argument("--loss_w_seg", type=float, default=1.0,
+                        help="Weight for segmentation BCE loss")
     parser.add_argument("--loss_w_flow", type=float, default=1.0,
                         help="Weight for RPF flow velocity MSE loss")
 
@@ -453,9 +417,7 @@ def main():
                         help="Freeze PointNet++ encoder after this epoch (-1 = never)")
 
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb_project", default="stone-volume")
-    parser.add_argument("--mlflow", action="store_true")
-    parser.add_argument("--mlflow_experiment", default="stone-volume")
+    parser.add_argument("--wandb_project", default="stone-recon")
 
     args = parser.parse_args()
 
@@ -476,11 +438,7 @@ def main():
         precision=args.precision,
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
-        use_mlflow=args.mlflow,
-        mlflow_experiment=args.mlflow_experiment,
         loss_w_seg=args.loss_w_seg,
-        loss_w_volume=args.loss_w_volume,
-        loss_w_mape=args.loss_w_mape,
         loss_w_flow=args.loss_w_flow,
         patience=args.patience,
         width=args.width,

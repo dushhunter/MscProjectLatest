@@ -1,12 +1,17 @@
-"""StoneVolumeNet: end-to-end multi-view stone volume estimator.
+"""StoneReconNet: neural multi-view stone segmentation and registration.
 
-Combines PointNet++ per-view encoder, per-point segmentation head,
-RPF-style rectified flow registration, and a volume regression MLP.
+Replaces the classical pipeline (RANSAC + ICP + pose graph) with a trained
+neural model:
+  1. PointNet++ encoder extracts per-view features.
+  2. Segmentation head separates stone from floor/background.
+  3. Multi-view attention fuses features across views (RAP-inspired DiTLayer).
+  4. RPF-style rectified flow learns to register point clouds.
 
-The rectified flow branch (adapted from Rectified Point Flow, NeurIPS 2025)
-learns a velocity field that transports noisy points to their GT registered
-positions. At inference time, Euler ODE integration produces the registered
-point cloud from which volume is estimated.
+At inference, Euler ODE integration produces a registered stone point cloud.
+Poisson surface reconstruction then creates a watertight mesh for volume
+measurement -- no classical registration or TSDF needed.
+
+Adapted from Rectified Point Flow (RPF), NeurIPS 2025 Spotlight.
 """
 
 from __future__ import annotations
@@ -24,8 +29,8 @@ from .encoder import PointNetPPEncoder, SegmentationHead
 
 
 @dataclass
-class StoneVolumeNetConfig:
-    """Configuration for StoneVolumeNet."""
+class StoneReconNetConfig:
+    """Configuration for StoneReconNet."""
 
     sa1_npoint: int = 2048
     sa1_radius: float = 0.01
@@ -52,38 +57,11 @@ class StoneVolumeNetConfig:
     attn_dropout: float = 0.0
 
     seg_hidden_dim: int = 128
-    vol_hidden_dim: int = 256
 
     # RPF flow parameters
     flow_loss_type: str = "mse"
     timestep_sampling: str = "u_shaped"
     inference_sampling_steps: int = 10
-
-
-class VolumeHead(nn.Module):
-    """Predicts stone volume from aggregated multi-view features."""
-
-    def __init__(self, input_dim: int, hidden_dim: int = 256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Softplus(),
-        )
-
-    def forward(self, global_feat: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            global_feat: (B, D) global feature vector.
-
-        Returns:
-            (B,) predicted volume (always positive via Softplus).
-        """
-        return self.net(global_feat).squeeze(-1)
 
 
 class FlowHead(nn.Module):
@@ -102,25 +80,23 @@ class FlowHead(nn.Module):
         return self.net(features)
 
 
-class StoneVolumeNet(nn.Module):
-    """End-to-end multi-view stone volume estimation with RPF-style flow.
+class StoneReconNet(nn.Module):
+    """Neural multi-view stone reconstruction with RPF-style flow registration.
 
     Pipeline:
       1. PointNet++ encodes each view's point cloud (shared weights).
-      2. Segmentation head predicts stone vs background per point.
-      3. Multi-view attention fuses features (also serves as the flow model).
+      2. Segmentation head classifies stone vs floor/background per point.
+      3. Multi-view attention fuses features across views.
       4. Flow head predicts per-point velocity field (RPF rectified flow).
-      5. Volume MLP predicts the stone volume from global features.
 
-    During training the flow branch learns to transport noisy points to their
-    GT registered positions via rectified flow (following RPF, NeurIPS 2025).
-    At inference, Euler ODE integration produces the registered point cloud.
+    Training: segmentation BCE + flow velocity MSE.
+    Inference: segment stone -> Euler ODE registration -> Poisson mesh -> volume.
     """
 
-    def __init__(self, cfg: Optional[StoneVolumeNetConfig] = None):
+    def __init__(self, cfg: Optional[StoneReconNetConfig] = None):
         super().__init__()
         if cfg is None:
-            cfg = StoneVolumeNetConfig()
+            cfg = StoneReconNetConfig()
         self.cfg = cfg
 
         self.encoder = PointNetPPEncoder(
@@ -155,11 +131,6 @@ class StoneVolumeNet(nn.Module):
         )
 
         self.flow_head = FlowHead(embed_dim=cfg.attn_embed_dim)
-
-        self.volume_head = VolumeHead(
-            input_dim=cfg.attn_embed_dim,
-            hidden_dim=cfg.vol_hidden_dim,
-        )
 
         self.timestep_sampling = cfg.timestep_sampling
         self.flow_loss_type = cfg.flow_loss_type
@@ -209,7 +180,7 @@ class StoneVolumeNet(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Full forward pass for training (includes flow branch).
+        """Training forward pass: encode, segment, fuse, and compute flow.
 
         Args:
             batch: dict with keys:
@@ -218,9 +189,6 @@ class StoneVolumeNet(nn.Module):
                 - pad_mask: (B, N) True for padded positions
                 - n_points: (B,) actual number of points per sample
                 - gt_points_registered: (B, N, 3) clean GT positions (flow target)
-
-        Returns:
-            dict with seg_logits, pred_volume, and flow outputs (v_pred, v_t, t).
         """
         points = batch["points"]
         view_ids = batch["view_ids"]
@@ -238,12 +206,8 @@ class StoneVolumeNet(nn.Module):
 
         fused = self.multi_view_attn(sa_feat, sa_xyz, sa_view_ids, sa_pad_mask)
 
-        fused_global = fused.max(dim=1)[0]
-        pred_volume = self.volume_head(fused_global)
-
         output = {
             "seg_logits": seg_logits,
-            "pred_volume": pred_volume,
             "fused_features": fused,
             "sa_xyz": sa_xyz,
         }
@@ -256,9 +220,7 @@ class StoneVolumeNet(nn.Module):
             x_1 = torch.randn_like(x_0_sa)
             x_t, v_t = self._compute_flow_target(x_0_sa, x_1, timesteps)
 
-            flow_input = sa_feat + self.multi_view_attn.pos_enc(x_t)
-            flow_fused = fused
-            v_pred = self.flow_head(flow_fused)
+            v_pred = self.flow_head(fused)
 
             output["v_pred"] = v_pred
             output["v_t"] = v_t
@@ -270,7 +232,7 @@ class StoneVolumeNet(nn.Module):
         return output
 
     def forward_inference(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Inference-only forward (no flow training, just encode + segment + volume)."""
+        """Inference forward: encode, segment, fuse features."""
         points = batch["points"]
         view_ids = batch["view_ids"]
         pad_mask = batch["pad_mask"]
@@ -287,12 +249,8 @@ class StoneVolumeNet(nn.Module):
 
         fused = self.multi_view_attn(sa_feat, sa_xyz, sa_view_ids, sa_pad_mask)
 
-        fused_global = fused.max(dim=1)[0]
-        pred_volume = self.volume_head(fused_global)
-
         return {
             "seg_logits": seg_logits,
-            "pred_volume": pred_volume,
             "fused_features": fused,
             "sa_xyz": sa_xyz,
             "sa_feat": sa_feat,
@@ -303,34 +261,32 @@ class StoneVolumeNet(nn.Module):
     def sample_rectified_flow(
         self, batch: Dict[str, torch.Tensor],
         num_steps: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Euler ODE integration for flow-based registration (from RPF).
 
         Integrates from t=1 (noise) toward t=0 (registered) to produce
         the registered point cloud at the SA level.
 
         Returns:
-            (B, M, 3) registered point positions.
+            registered_points: (B, M, 3) registered point positions.
+            seg_logits: (B, N) per-point segmentation logits.
         """
         if num_steps is None:
             num_steps = self.inference_sampling_steps
 
         inf_out = self.forward_inference(batch)
-        sa_xyz = inf_out["sa_xyz"]
-        sa_feat = inf_out["sa_feat"]
-        sa_view_ids = inf_out["sa_view_ids"]
         fused = inf_out["fused_features"]
+        sa_xyz = inf_out["sa_xyz"]
         B, M, _ = sa_xyz.shape
 
         x_t = torch.randn(B, M, 3, device=sa_xyz.device)
         dt = 1.0 / num_steps
 
         for step in range(num_steps):
-            t = 1.0 - step * dt
             v_pred = self.flow_head(fused)
             x_t = x_t - v_pred * dt
 
-        return x_t
+        return x_t, inf_out["seg_logits"]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -354,10 +310,10 @@ class StoneVolumeNet(nn.Module):
         batch_idx = torch.arange(B, device=nn_idx.device).unsqueeze(1).expand(B, M)
         return gt_full[batch_idx, nn_idx]
 
-    def get_registered_points(
+    def get_stone_points(
         self, batch: Dict[str, torch.Tensor], output: Dict[str, torch.Tensor],
     ) -> List[torch.Tensor]:
-        """Extract per-sample stone point clouds from the model output."""
+        """Extract per-sample stone-only point clouds using segmentation."""
         points = batch["points"]
         seg_probs = torch.sigmoid(output["seg_logits"])
         pad_mask = batch["pad_mask"]
@@ -393,6 +349,5 @@ class StoneVolumeNet(nn.Module):
             "seg_head": _count(self.seg_head),
             "multi_view_attn": _count(self.multi_view_attn),
             "flow_head": _count(self.flow_head),
-            "volume_head": _count(self.volume_head),
             "total": _count(self),
         }

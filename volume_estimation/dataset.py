@@ -1,7 +1,8 @@
-"""PyTorch dataset for multi-view stone volume estimation.
+"""PyTorch dataset for multi-view stone segmentation and registration.
 
 Each sample is a random subset of K depth views from a single stone,
-along with ground-truth segmentation masks and the GT volume.
+along with ground-truth segmentation masks and registered point positions.
+GT volume (from Blender) is optionally included for validation metrics.
 """
 
 from __future__ import annotations
@@ -63,18 +64,19 @@ def _random_rotation_matrix(max_angle_deg: float) -> np.ndarray:
     return (Rz @ Ry @ Rx).astype(np.float32)
 
 
-class StoneVolumeDataset(Dataset):
-    """Dataset that yields random multi-view samples for stone volume training.
+class StoneReconDataset(Dataset):
+    """Dataset that yields random multi-view samples for stone reconstruction.
 
     Each __getitem__ call picks a stone at random, selects K random views,
     back-projects them to 3D, applies GT masks and turntable transforms,
-    and returns the points with segmentation labels and volume.
+    and returns points with segmentation labels and registered positions.
+    GT volume is optionally included for validation metrics.
     """
 
     def __init__(
         self,
         dataset_dir: str,
-        volumes_json: str,
+        volumes_json: Optional[str],
         intrinsics_path: str,
         stone_ids: List[str],
         width: int = 1024,
@@ -106,14 +108,15 @@ class StoneVolumeDataset(Dataset):
         self.point_dropout_rate = point_dropout_rate
         self.samples_per_epoch = samples_per_epoch
 
-        with open(volumes_json, "r") as f:
-            vol_data = json.load(f)
         self.volumes: Dict[str, float] = {}
-        for sid in self.stone_ids:
-            if sid in vol_data:
-                self.volumes[sid] = float(vol_data[sid]["volume_cm3"])
-            else:
-                raise KeyError(f"Stone '{sid}' not found in {volumes_json}")
+        if volumes_json is not None:
+            with open(volumes_json, "r") as f:
+                vol_data = json.load(f)
+            for sid in self.stone_ids:
+                if sid in vol_data:
+                    self.volumes[sid] = float(vol_data[sid]["volume_cm3"])
+                else:
+                    raise KeyError(f"Stone '{sid}' not found in {volumes_json}")
 
         from neural_pipeline.geometry import load_intrinsics
         self._intrinsics_cache: Dict[str, Tuple[float, float, float, float]] = {}
@@ -224,13 +227,10 @@ class StoneVolumeDataset(Dataset):
 
         points = points - points.mean(axis=0)
 
-        gt_volume = self.volumes[stone_id]
-
-        return {
+        sample = {
             "points": torch.from_numpy(points.astype(np.float32)),
             "seg_labels": torch.from_numpy(seg_labels),
             "view_ids": torch.from_numpy(view_ids),
-            "gt_volume": torch.tensor(gt_volume, dtype=torch.float32),
             "n_views": torch.tensor(K, dtype=torch.int64),
             "stone_id": stone_id,
             "gt_points_registered": torch.from_numpy(
@@ -238,13 +238,19 @@ class StoneVolumeDataset(Dataset):
             ),
         }
 
+        if stone_id in self.volumes:
+            sample["gt_volume"] = torch.tensor(
+                self.volumes[stone_id], dtype=torch.float32,
+            )
+
+        return sample
+
     def _empty_sample(self) -> Dict[str, torch.Tensor]:
         """Fallback for degenerate cases."""
         return {
             "points": torch.zeros(1, 3),
             "seg_labels": torch.zeros(1),
             "view_ids": torch.zeros(1, dtype=torch.int64),
-            "gt_volume": torch.tensor(0.0),
             "n_views": torch.tensor(0, dtype=torch.int64),
             "stone_id": "",
             "gt_points_registered": torch.zeros(1, 3),
@@ -266,10 +272,11 @@ def collate_variable_points(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     view_padded = torch.zeros(B, max_pts, dtype=torch.int64)
     pad_mask = torch.ones(B, max_pts, dtype=torch.bool)
 
-    gt_volumes = []
     n_views_list = []
     stone_ids = []
     n_points = []
+    gt_volumes = []
+    has_volume = "gt_volume" in batch[0]
 
     for i, b in enumerate(batch):
         n = b["points"].shape[0]
@@ -278,19 +285,24 @@ def collate_variable_points(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         seg_padded[i, :n] = b["seg_labels"]
         view_padded[i, :n] = b["view_ids"]
         pad_mask[i, :n] = False
-        gt_volumes.append(b["gt_volume"])
         n_views_list.append(b["n_views"])
         stone_ids.append(b["stone_id"])
         n_points.append(n)
+        if has_volume:
+            gt_volumes.append(b["gt_volume"])
 
-    return {
+    result = {
         "points": points_padded,
         "gt_points_registered": gt_reg_padded,
         "seg_labels": seg_padded,
         "view_ids": view_padded,
         "pad_mask": pad_mask,
-        "gt_volume": torch.stack(gt_volumes),
         "n_views": torch.stack(n_views_list),
         "stone_ids": stone_ids,
         "n_points": torch.tensor(n_points, dtype=torch.int64),
     }
+
+    if has_volume:
+        result["gt_volume"] = torch.stack(gt_volumes)
+
+    return result

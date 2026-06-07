@@ -1,12 +1,15 @@
-# StoneVolumeNet: End-to-End Multi-View Stone Volume Estimation
+# StoneReconNet: Neural Stone Segmentation, Registration, and Volume Measurement
 
-An end-to-end deep learning model that takes multi-view depth maps of a stone as input and directly predicts its volume. The model incorporates stone segmentation, multi-view feature fusion, and **RPF-style rectified flow registration** -- all in a single network.
+A deep learning model that segments stone points from multi-view depth maps, registers them into a unified 3D coordinate frame via **RPF-style rectified flow**, and reconstructs a watertight mesh for **geometric volume measurement**.
+
+The neural network handles segmentation and registration. Volume is computed geometrically from the Poisson-reconstructed mesh -- not predicted by the network.
 
 Adapted from **Rectified Point Flow (RPF)** ([GradientSpaces/Rectified-Point-Flow](https://github.com/GradientSpaces/Rectified-Point-Flow), NeurIPS 2025 Spotlight) and **RAP** ([PRBonn/RAP](https://github.com/PRBonn/RAP), NeurIPS 2025).
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Pipeline Visualization](#pipeline-visualization)
 - [Architecture](#architecture)
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
@@ -21,19 +24,282 @@ Adapted from **Rectified Point Flow (RPF)** ([GradientSpaces/Rectified-Point-Flo
 
 ## Overview
 
-**Problem**: Given multi-view depth maps of a stone captured on a turntable, estimate the stone's volume.
+**Problem**: Given multi-view depth maps of a stone captured on a turntable, measure the stone's volume accurately.
 
-**Approach**: StoneVolumeNet is a multi-task model that simultaneously:
+**Approach**: StoneReconNet replaces the classical pipeline (RANSAC + ICP + pose graph + TSDF) with a trained neural model for segmentation and registration, followed by classical Poisson mesh reconstruction for volume:
 
-1. **Segments** stone vs background points (per-point binary classification)
-2. **Registers** point clouds from different views using a learned velocity field (RPF rectified flow)
-3. **Predicts** the scalar volume of the stone from fused multi-view features
+```
+Multi-view depth maps
+        |
+        v
+[Neural] Segmentation: stone vs floor/background (PointNet++ + BCE)
+[Neural] Registration:  align views via RPF flow  (Euler ODE integration)
+        |
+        v
+    Registered stone point cloud
+        |
+        v
+[Classical] Poisson surface reconstruction (Open3D)
+        |
+        v
+    Watertight mesh --> mesh.get_volume()
+```
 
-**Training data**: 12 synthetic stones rendered in Blender, 120 turntable views each (3 degrees/frame), with ground-truth segmentation masks and known volumes.
+**Training data**: 12 synthetic stones rendered in Blender, 120 turntable views each (3 degrees/frame), with ground-truth segmentation masks. GT volumes from Blender are used for validation only.
 
-**Inference**: Works with sparse views (e.g., 24 out of 120) and produces a volume prediction plus an optional registered 3D point cloud.
+**Inference**: Works with sparse views (e.g., 24 out of 120). Produces a 3D mesh and geometric volume.
 
 **Hardware**: Designed for NVIDIA RTX 4080 16GB with fp16 mixed precision.
+
+---
+
+## Pipeline Visualization
+
+### End-to-End Inference Pipeline
+
+The complete flow from raw depth maps to measured volume:
+
+```
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  STEP 1: INPUT — Multiple Depth Views (.npy)                       │
+ │                                                                     │
+ │   View 1          View 2          View 3    ...    View 24          │
+ │  ┌─────────┐    ┌─────────┐    ┌─────────┐      ┌─────────┐       │
+ │  │ ░░▓▓▓░░ │    │ ░░▓▓░░░ │    │ ░▓▓▓▓░░ │      │ ░░▓▓▓░░ │       │
+ │  │ ░▓▓▓▓▓░ │    │ ░▓▓▓▓░░ │    │ ▓▓▓▓▓▓░ │      │ ░▓▓▓▓▓░ │       │
+ │  │ ▓▓▓▓▓▓▓ │    │ ▓▓▓▓▓▓░ │    │ ▓▓▓▓▓▓▓ │      │ ▓▓▓▓▓▓▓ │       │
+ │  │ ▓▓▓▓▓▓▓ │    │ ▓▓▓▓▓▓▓ │    │ ▓▓▓▓▓▓▓ │      │ ▓▓▓▓▓▓▓ │       │
+ │  │▄▄▄▄▄▄▄▄▄│    │▄▄▄▄▄▄▄▄▄│    │▄▄▄▄▄▄▄▄▄│      │▄▄▄▄▄▄▄▄▄│       │
+ │   depth.npy       depth.npy      depth.npy         depth.npy        │
+ │                                                                     │
+ │   (Each .npy is a depth map from a different turntable angle)       │
+ └──────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  STEP 2: BACK-PROJECTION — Depth pixels to 3D points              │
+ │                                                                     │
+ │   depth(u,v) ──► X = (u - cx) * Z / fx                            │
+ │                  Y = (v - cy) * Z / fy     Each view becomes       │
+ │                  Z = depth(u,v)             a 3D point cloud       │
+ │                                                                     │
+ │   View 1 cloud    View 2 cloud    View 3 cloud   ...               │
+ │      ·  ··            · ·            ··  ·                          │
+ │     · ·· ·          ·· ··          · ··· ·                          │
+ │    ······ ·        ·····          ········                           │
+ │   ·········       ·······        ·········                          │
+ │   ▄▄▄▄▄▄▄▄▄      ▄▄▄▄▄▄▄▄      ▄▄▄▄▄▄▄▄▄                        │
+ │   (stone+floor)   (stone+floor)  (stone+floor)                     │
+ └──────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  STEP 3: NEURAL SEGMENTATION — Separate stone from floor           │
+ │                                                                     │
+ │   PointNet++ encodes each view (shared weights)                     │
+ │   Segmentation Head classifies each point: stone or floor?          │
+ │                                                                     │
+ │   Before segmentation:        After segmentation:                   │
+ │      · ·· ·                      · ·· ·  ← stone points (keep)     │
+ │     · ·· · ·                    · ·· · ·                            │
+ │    ········ ·                  ········ ·                            │
+ │   ···········                 ···········                            │
+ │   ▄▄▄▄▄▄▄▄▄▄▄  ← floor      ░░░░░░░░░░░  ← floor removed        │
+ │                                                                     │
+ │   Loss: BCE(predicted_label, GT_mask)                               │
+ └──────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  STEP 4: MULTI-VIEW ATTENTION — Fuse features across all views     │
+ │                                                                     │
+ │   View 1 feats    View 2 feats    View 3 feats                     │
+ │   ┌──────────┐    ┌──────────┐    ┌──────────┐                     │
+ │   │ f1,f2,f3 │    │ f1,f2,f3 │    │ f1,f2,f3 │                     │
+ │   └────┬─────┘    └────┬─────┘    └────┬─────┘                     │
+ │        │               │               │                            │
+ │        └───────────────┼───────────────┘                            │
+ │                        ▼                                            │
+ │              ┌─────────────────┐                                    │
+ │              │  4x DiTLayer    │  RAP-inspired attention            │
+ │              │  (part-wise +   │  with sinusoidal 3D               │
+ │              │   global attn)  │  position encoding                │
+ │              └────────┬────────┘                                    │
+ │                       ▼                                             │
+ │              Fused features (all views merged)                      │
+ └──────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  STEP 5: RPF FLOW REGISTRATION — Align all views together          │
+ │                                                                     │
+ │   Euler ODE integration (10 steps, from noise to registered):       │
+ │                                                                     │
+ │   t=1.0 (noise)   t=0.7          t=0.3          t=0.0 (registered) │
+ │     · ·  ·          ·· ·           ··· ·          ·····             │
+ │    ·   · ·         · ·· ·         ·····          ······             │
+ │   ·  ·  · ·       ·· ··· ·      ······ ·       ········            │
+ │    · ·  ·          ·· ···        ········       ·········           │
+ │                                                                     │
+ │   Random noise     Partially      Mostly         All views          │
+ │                    aligned        aligned         registered!        │
+ │                                                                     │
+ │   Loss: MSE(v_predicted, v_target)                                  │
+ └──────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  STEP 6: POISSON SURFACE RECONSTRUCTION — Point cloud to mesh      │
+ │                                                                     │
+ │   Registered stone           Estimate normals     Poisson mesh      │
+ │   point cloud                per point            (watertight)      │
+ │                                                                     │
+ │      ·····                   ↗·····↗               ┌─────────┐     │
+ │     ······                  ↗······↗              ╱           ╲     │
+ │    ········      ──►       ↗········↗    ──►     │             │    │
+ │   ·········               ↗·········↗             ╲           ╱     │
+ │                                                     └─────────┘     │
+ │                                                    (closed surface  │
+ │                                                     including the   │
+ │   Open3D: create_from_point_cloud_poisson()         unseen bottom!) │
+ └──────────────────────────────┬──────────────────────────────────────┘
+                                │
+                                ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  STEP 7: GEOMETRIC VOLUME — Exact volume from mesh                 │
+ │                                                                     │
+ │   volume_cm3 = abs(mesh.get_volume())                               │
+ │                                                                     │
+ │    ┌─────────┐                                                      │
+ │   ╱           ╲     Watertight mesh defines a closed                │
+ │  │   V = ?     │    3D region. Volume is computed                   │
+ │   ╲           ╱     by summing signed tetrahedra                    │
+ │    └─────────┘      volumes (divergence theorem).                   │
+ │                                                                     │
+ │   Output: 1.234 cm3                                                 │
+ └─────────────────────────────────────────────────────────────────────┘
+```
+
+### Training vs Inference
+
+```
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │                        TRAINING                                     │
+ │                                                                     │
+ │  120 views/stone ──► PointNet++ ──► Seg Head ──────► BCE loss       │
+ │  (with GT masks)      Encoder    ╲                                  │
+ │  (with GT poses)                  ╲                                 │
+ │                                    Multi-View ──► Flow ──► MSE loss │
+ │                                    Attention      Head              │
+ │                                                                     │
+ │  The model learns:                                                  │
+ │    1. Which points belong to the stone (segmentation)               │
+ │    2. How to align scattered views into one cloud (registration)    │
+ │                                                                     │
+ │  NOTE: Volume is NOT part of the loss! No volume regression.        │
+ └─────────────────────────────────────────────────────────────────────┘
+
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │                       INFERENCE                                     │
+ │                                                                     │
+ │  24 sparse     Trained        Registered         Poisson       Vol  │
+ │  views ──────► Model ───────► Stone Point ──────► Mesh ──────► cm3  │
+ │  (.npy)        (seg+flow)     Cloud (.ply)        (.ply)            │
+ │                                                                     │
+ │  The model does: segment + register (neural)                        │
+ │  Then we do:     mesh + volume             (classical, exact)       │
+ └─────────────────────────────────────────────────────────────────────┘
+```
+
+### Classical Pipeline vs StoneReconNet
+
+```
+ CLASSICAL (reconstruct_stone_3d_sparse.py):
+
+  depth ──► RANSAC ──► ICP ──► Pose Graph ──► TSDF ──► Mesh ──► Volume
+            (floor    (pair    (global        (voxel   (marching
+            removal)   align)   optimize)     fusion)   cubes)
+
+  Pros: No training needed
+  Cons: Fragile to noise, slow, requires good overlap
+
+
+ NEURAL (StoneReconNet):
+
+  depth ──► PointNet++ ──► Seg Head  ──► RPF Flow ──► Poisson ──► Volume
+            (learned       (learned       (learned      (exact
+            features)      separation)    alignment)    geometry)
+
+  Pros: Robust, fast, learns from data, handles sparse views
+  Cons: Requires training data (12 stones, 120 views each)
+```
+
+### What Happens to Each Point
+
+```
+ Single depth pixel at position (u, v):
+
+  ┌──────────┐     ┌──────────────┐     ┌───────────────┐
+  │ depth=   │     │ 3D point in  │     │ Is it stone   │
+  │ 0.532 m  │ ──► │ camera frame │ ──► │ or floor?     │
+  │ at (u,v) │     │ (X, Y, Z)   │     │               │
+  └──────────┘     └──────────────┘     └───────┬───────┘
+                                                │
+                            ┌───────────────────┼────────────────────┐
+                            │                   │                    │
+                            ▼                   ▼                    │
+                     ┌────────────┐      ┌────────────┐              │
+                     │ STONE      │      │ FLOOR      │              │
+                     │ seg > 0.5  │      │ seg < 0.5  │              │
+                     │            │      │            │              │
+                     │ Keep for   │      │ Discard    │              │
+                     │ registration│      │            │              │
+                     └─────┬──────┘      └────────────┘              │
+                           │                                         │
+                           ▼                                         │
+                    ┌─────────────┐                                  │
+                    │ RPF Flow    │                                  │
+                    │ registers   │  All stone points from           │
+                    │ this point  │  all views get aligned           │
+                    │ with points │  into one coordinate frame       │
+                    │ from other  │                                  │
+                    │ views       │                                  │
+                    └─────┬───────┘                                  │
+                          │                                          │
+                          ▼                                          │
+                   Part of the final                                 │
+                   registered stone                                  │
+                   point cloud                                       │
+```
+
+### RPF Rectified Flow: How Registration Works
+
+```
+ TRAINING: Learn the velocity field
+
+   GT registered         Gaussian noise          Interpolated
+   positions (x_0)       (x_1)                   position (x_t)
+                                                  at time t
+       ·····               · ·  ·
+      ······     ◄─────   ·   · ·        x_t = (1-t)·x_0 + t·x_1
+     ········    v_target  ·  ·  · ·
+    ·········              · ·  ·         v_target = x_1 - x_0
+
+   The Flow Head learns to predict v_target from the features.
+
+ INFERENCE: Integrate the learned velocity
+
+   Step 0        Step 3        Step 7        Step 10
+   t=1.0         t=0.7         t=0.3         t=0.0
+   (noise)                                   (registered)
+
+    · ·  ·         ·· ·          ····          ·····
+   ·   · ·        · ·· ·        ·····         ······
+   ·  ·  · ·     ·· ··· ·     ······ ·      ········
+    · ·  ·        ·· ···       ·······       ·········
+
+   x_t ◄── x_t - v_pred * dt   (Euler step, repeated 10 times)
+```
 
 ---
 
@@ -50,44 +316,55 @@ Input: Multi-view depth maps (.npy)
   |              |
   v              v
 [Seg Head]    [Multi-View Attention]  (RAP-inspired DiTLayer)
-  |              |            |
-  |              v            v
-  |         [Flow Head]  [Volume Head]
-  |              |            |
-  v              v            v
-BCE loss    MSE loss      L1 + MAPE loss
-(stone/bg)  (velocity)    (volume)
+  |              |
+  |              v
+  |         [Flow Head]  --> velocity field (RPF rectified flow)
+  |              |
+  v              v
+BCE loss    MSE loss
+(stone/bg)  (velocity)
 ```
 
 ### Module Breakdown
 
 | Module | Description | Parameters |
 |--------|-------------|------------|
-| **PointNet++ Encoder** | 3 Set Abstraction layers (FPS + ball query + shared MLP). Encodes each view's point cloud with shared weights. | ~280K |
-| **Segmentation Head** | Per-point binary classifier. Propagates SA3-level features back to full resolution via NN interpolation. | ~42K |
-| **Multi-View Attention** | 4-layer DiTLayer stack with part-wise (within-view) and global (cross-view) attention, sinusoidal 3D position encoding, and learnable view embeddings. | ~5.3M |
-| **Flow Head** | Small MLP that predicts per-point 3D velocity from attention features. Trained with RPF's rectified flow objective. | ~67K |
-| **Volume Head** | MLP that regresses scalar volume from max-pooled global features. Softplus output ensures positive values. | ~99K |
-| **Total** | | **~5.8M** |
+| **PointNet++ Encoder** | 3 Set Abstraction layers (FPS + ball query + shared MLP). Shared weights across views. | ~280K |
+| **Segmentation Head** | Per-point binary classifier. NN interpolation from SA3 to full resolution. | ~42K |
+| **Multi-View Attention** | 4-layer DiTLayer with part-wise and global attention, sinusoidal 3D position encoding. | ~5.3M |
+| **Flow Head** | MLP predicting per-point 3D velocity from attention features. | ~67K |
+| **Total** | | **~5.7M** |
 
 ### RPF Rectified Flow Branch
 
 During training, the flow branch learns to transport random noise to GT registered positions:
 
-1. **Sample timestep** `t` from a U-shaped distribution (more samples near t=0 and t=1)
+1. **Sample timestep** `t` from a U-shaped distribution
 2. **Interpolate**: `x_t = (1 - t) * x_0 + t * x_1` where `x_0` = GT positions, `x_1` = Gaussian noise
 3. **Predict velocity**: `v_pred = flow_head(attention_features)`
 4. **Supervise**: MSE between `v_pred` and target `v_t = x_1 - x_0`
 
-During inference, **Euler ODE integration** from t=1 (noise) to t=0 produces the registered point cloud:
+During inference, **Euler ODE integration** produces the registered point cloud:
 
-```
-x_t = random_noise
+```python
+x_t = random_noise       # start from t=1
 for step in range(num_steps):
     v = flow_head(features)
-    x_t = x_t - v * dt
-# x_t is now the registered point cloud
+    x_t = x_t - v * dt   # step toward t=0
+# x_t is now the registered stone point cloud
 ```
+
+### Poisson Mesh & Volume (inference only)
+
+After the model produces a registered point cloud:
+
+```python
+pcd.estimate_normals(...)
+mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
+volume_cm3 = abs(mesh.get_volume())
+```
+
+Poisson reconstruction creates a watertight surface (including the unseen bottom of the stone) from which volume is computed geometrically.
 
 ---
 
@@ -98,13 +375,13 @@ volume_estimation/
     __init__.py
     encoder.py        # PointNet++ encoder (FPS, ball query, SA layers)
     attention.py       # Multi-view attention (DiTLayer, position encoding)
-    model.py           # StoneVolumeNet (combines all modules + RPF flow)
-    loss.py            # Multi-task loss (BCE + L1 + MAPE + flow MSE)
-    dataset.py         # StoneVolumeDataset with augmentation + GT flow targets
+    model.py           # StoneReconNet (PointNet++ + SegHead + Attention + FlowHead)
+    loss.py            # Segmentation BCE + flow velocity MSE
+    dataset.py         # StoneReconDataset with augmentation + GT flow targets
     train.py           # PyTorch Lightning training script
     prepare_gt.py      # Generate GT volumes via voxelization/convex hull
 
-predict_stone_volume.py  # CLI inference tool with optional flow registration
+predict_stone_volume.py  # CLI: model -> Poisson mesh -> volume
 ```
 
 ---
@@ -114,7 +391,6 @@ predict_stone_volume.py  # CLI inference tool with optional flow registration
 **Python 3.10** (required for `from __future__ import annotations`):
 
 ```bash
-# The project venv already has Python 3.10
 ./venv/bin/python --version  # Should print Python 3.10.x
 ```
 
@@ -145,26 +421,18 @@ Repeat for each stone (stone_01 through stone_12).
 
 ### 2. Create the ground-truth volumes JSON
 
-Create `stone_volumes_gt.json` in the project root with volumes obtained from Blender (in cm3):
+Create `stone_volumes_gt.json` with volumes from Blender (in cm3). These are used for validation metrics only -- the network does **not** predict volume directly.
 
 ```json
 {
   "stone_01": { "volume_cm3": 1.23 },
   "stone_02": { "volume_cm3": 2.45 },
-  "stone_03": { "volume_cm3": 0.87 },
-  "stone_04": { "volume_cm3": 3.10 },
-  "stone_05": { "volume_cm3": 1.95 },
-  "stone_06": { "volume_cm3": 2.78 },
-  "stone_07": { "volume_cm3": 0.56 },
-  "stone_08": { "volume_cm3": 4.12 },
-  "stone_09": { "volume_cm3": 1.67 },
-  "stone_10": { "volume_cm3": 3.34 },
-  "stone_11": { "volume_cm3": 2.01 },
+  ...
   "stone_12": { "volume_cm3": 1.45 }
 }
 ```
 
-**How to get volume from Blender**: Select the stone object, then in the Python console:
+**How to get volume from Blender**: Select the stone object, then:
 
 ```python
 import bpy, bmesh
@@ -180,9 +448,9 @@ bm.free()
 
 ```
 stone_syn_dataset/
-    stone_01_depth_npy/       # 120 depth files: depth_0001.npy ... depth_0120.npy
+    stone_01_depth_npy/       # 120 depth files
     stone_01/
-        masks/                # 120 mask files: mask_0001.png ... mask_0120.png
+        masks/                # 120 mask PNGs
     stone_02_depth_npy/
     stone_02/
         masks/
@@ -190,21 +458,13 @@ stone_syn_dataset/
     stone_01_sparse_npy_n24/  # (for inference) 24 sparse views
 ```
 
-### 4. (Optional) Generate GT point clouds via prepare_gt.py
-
-This merges all 120 views into a dense registered point cloud and computes volume via voxelization. Useful for validation but not required if you already have Blender volumes:
-
-```bash
-./venv/bin/python -m volume_estimation.prepare_gt \
-  --dataset_dir stone_syn_dataset \
-  --intrinsics splits/stone/intrinsics.txt \
-  --stone_id stone_01 \
-  --width 1024 --height 576
-```
-
 ---
 
 ## Training
+
+Training teaches the model two tasks:
+1. **Segmentation**: which points are stone vs floor/background (BCE loss)
+2. **Registration**: how to align multi-view point clouds (flow velocity MSE loss)
 
 ### Basic training command
 
@@ -219,15 +479,13 @@ This merges all 120 views into a dense registered point cloud and computes volum
   --lr 1e-3 \
   --precision 16-mixed \
   --loss_w_seg 1.0 \
-  --loss_w_volume 0.1 \
-  --loss_w_mape 0.05 \
   --loss_w_flow 1.0 \
   --patience 30
 ```
 
 ### Two-stage training (freeze encoder after warmup)
 
-Following RPF's approach, freeze the PointNet++ encoder after the initial epochs to let the flow and volume heads learn more independently:
+Freeze the PointNet++ encoder after initial epochs. The attention and flow head continue learning:
 
 ```bash
 ./venv/bin/python -m volume_estimation.train \
@@ -239,28 +497,9 @@ Following RPF's approach, freeze the PointNet++ encoder after the initial epochs
   --batch_size 4 \
   --lr 1e-3 \
   --precision 16-mixed \
+  --loss_w_seg 1.0 \
   --loss_w_flow 1.0 \
   --freeze_encoder_after 50
-```
-
-### With experiment tracking
-
-```bash
-# With Weights & Biases
-./venv/bin/python -m volume_estimation.train \
-  --dataset_dir stone_syn_dataset \
-  --volumes_json stone_volumes_gt.json \
-  --intrinsics splits/stone/intrinsics.txt \
-  --output_dir volume_training_output \
-  --wandb --wandb_project stone-volume
-
-# With MLflow
-./venv/bin/python -m volume_estimation.train \
-  --dataset_dir stone_syn_dataset \
-  --volumes_json stone_volumes_gt.json \
-  --intrinsics splits/stone/intrinsics.txt \
-  --output_dir volume_training_output \
-  --mlflow --mlflow_experiment stone-volume
 ```
 
 ### Training output
@@ -268,21 +507,20 @@ Following RPF's approach, freeze the PointNet++ encoder after the initial epochs
 ```
 volume_training_output/
     checkpoints/
-        best-epoch=042-val_vol_mae=0.1234.ckpt   # Top-3 checkpoints by val MAE
-        last.ckpt                                  # Latest checkpoint
-    stone_volume_net.pt            # Final model weights (state_dict only)
-    training_summary.json          # Training config and results
-    tb_logs/                       # TensorBoard logs (default logger)
+        best-epoch=042-val_loss=0.1234.ckpt  # Top-3 by val/loss
+        last.ckpt
+    stone_recon_net.pt           # Final model weights (state_dict)
+    training_summary.json        # Training config and results
+    tb_logs/                     # TensorBoard logs
 ```
 
 ### What the training loop does (RPF pattern)
 
-Each training step follows RPF's `forward() -> loss() -> training_step()` pattern:
+Each step follows RPF's `forward() -> loss() -> training_step()`:
 
-1. **forward()**: Encode points with PointNet++, run segmentation head, run multi-view attention, run flow branch (sample timestep, interpolate, predict velocity), run volume head
-2. **loss()**: Compute `w_seg * BCE + w_vol * L1 + w_mape * MAPE + w_flow * MSE(v_pred, v_target)`
-3. **training_step()**: Call forward(), call loss(), log all metrics
-4. **validation_step()**: Same as training + compute segmentation accuracy and R2 score
+1. **forward()**: Encode points, segment, run multi-view attention, compute flow velocity
+2. **loss()**: `w_seg * BCE(seg_logits, seg_labels) + w_flow * MSE(v_pred, v_target)`
+3. **training_step()**: forward -> loss -> log
 
 ### Logged metrics
 
@@ -291,90 +529,94 @@ Each training step follows RPF's `forward() -> loss() -> training_step()` patter
 | `train/loss` | Total weighted loss |
 | `train/seg_loss` | Segmentation BCE |
 | `train/flow_loss` | RPF velocity MSE |
-| `train/vol_l1` | Volume L1 error |
-| `train/vol_mape` | Volume MAPE |
-| `val/vol_mae` | Validation volume MAE (checkpoint monitor) |
-| `val/vol_r2` | Validation R2 score |
+| `train/seg_acc` | Segmentation accuracy |
+| `val/loss` | Validation total loss (checkpoint monitor) |
+| `val/seg_loss` | Validation segmentation loss |
+| `val/flow_loss` | Validation flow loss |
 | `val/seg_acc` | Validation segmentation accuracy |
+
+### Monitor with TensorBoard
+
+```bash
+./venv/bin/python -m tensorboard.main --logdir volume_training_output/tb_logs --port 6006
+```
 
 ### Train/val split
 
 - **Default**: stones 1-10 for training, stones 11-12 for validation
-- **Custom**: use `--val_stones stone_03 stone_07` to specify validation stones
-
-### CUDA optimizations (from RPF)
-
-The training script automatically enables:
-
-- `tf32` matmul and cuDNN for faster computation on Ampere+ GPUs
-- `cudnn.benchmark` for optimized convolution algorithms
-- Gradient clipping at 0.5
+- **Custom**: use `--val_stones stone_03 stone_07`
 
 ---
 
 ## Inference
 
-### Direct mode (volume prediction only)
+The inference pipeline is fully automatic:
 
-Fast single forward pass. Produces segmented point cloud and predicted volume:
-
-```bash
-./venv/bin/python predict_stone_volume.py \
-  --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
-  --intrinsics splits/stone/intrinsics.txt \
-  --sequence stone_01 \
-  --checkpoint volume_training_output/stone_volume_net.pt \
-  --output_dir volume_output/stone_01
+```
+Model checkpoint + sparse depth maps
+        |
+        v
+  [1] Encode + segment + RPF flow registration (Euler ODE)
+        |
+        v
+  [2] Poisson surface reconstruction -> watertight mesh
+        |
+        v
+  [3] mesh.get_volume() -> geometric volume in cm3
 ```
 
-### Flow registration mode (volume + registered point cloud)
-
-Adds RPF Euler ODE integration to produce a flow-registered 3D point cloud. Use this when you want to visualize or inspect the merged 3D shape:
+### Inference command
 
 ```bash
 ./venv/bin/python predict_stone_volume.py \
   --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
   --intrinsics splits/stone/intrinsics.txt \
   --sequence stone_01 \
-  --checkpoint volume_training_output/stone_volume_net.pt \
-  --output_dir volume_output/stone_01_flow \
-  --use_flow --flow_steps 10
+  --checkpoint volume_training_output/stone_recon_net.pt \
+  --output_dir volume_output/stone_01 \
+  --flow_steps 10 \
+  --poisson_depth 9
 ```
 
 ### Inference output
 
 ```
 volume_output/stone_01/
-    stone_pointcloud.ply       # Segmented stone points only
-    full_pointcloud.ply        # All input points (stone + background)
-    flow_registered.ply        # RPF flow-registered cloud (only with --use_flow)
-    volume_report.txt          # Human-readable report
-    prediction_result.json     # Machine-readable results
+    stone_registered.ply     # RPF flow-registered point cloud
+    stone_segmented.ply      # Segmented stone points (input space)
+    stone_mesh.ply           # Watertight Poisson mesh
+    volume_report.txt        # Human-readable report
+    prediction_result.json   # Machine-readable results
 ```
 
 ### Sample report
 
 ```
 ============================================================
-StoneVolumeNet - Prediction Report
+StoneReconNet -- Volume Prediction Report
 ============================================================
 
 Input:            stone_syn_dataset/stone_01_sparse_npy_n24
 Views:            24
 Total points:     85432
 Stone points:     62105 (72.7%)
+Flow points:      128
+Flow ODE steps:   10
 
-Predicted Volume: 1.234567 cm3
+--- Mesh Reconstruction ---
+Mesh vertices:    8532
+Mesh triangles:   17060
+Watertight:       True
+
+Volume:           1.234567 cm3
                   1234.57 mm3
 
-Inference time:   0.342 s
-Flow ODE steps:   10
-Flow points:      128
+Inference time:   0.542 s
 
 Output files:
-  Point cloud:    stone_pointcloud.ply
-  Full cloud:     full_pointcloud.ply
-  Flow cloud:     flow_registered.ply
+  Registered PC:  stone_registered.ply
+  Segmented PC:   stone_segmented.ply
+  Mesh:           stone_mesh.ply
   Report:         volume_report.txt
 ============================================================
 ```
@@ -387,28 +629,20 @@ Output files:
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--dataset_dir` | (required) | Root directory containing `stone_XX_depth_npy/` and `stone_XX/masks/` |
+| `--dataset_dir` | (required) | Root directory with depth data and masks |
 | `--volumes_json` | (required) | Path to `stone_volumes_gt.json` |
 | `--intrinsics` | (required) | Path to `intrinsics.txt` |
-| `--output_dir` | `volume_training_output` | Output directory for checkpoints and logs |
+| `--output_dir` | `volume_training_output` | Output directory |
 | `--max_epochs` | 200 | Maximum training epochs |
 | `--batch_size` | 4 | Batch size (4 fits in 16GB VRAM with fp16) |
 | `--lr` | 1e-3 | Peak learning rate (OneCycleLR) |
 | `--weight_decay` | 1e-4 | AdamW weight decay |
-| `--precision` | `16-mixed` | Training precision (`16-mixed`, `32`, `bf16-mixed`) |
-| `--max_points_per_view` | 4096 | Max points sampled per depth view |
-| `--train_samples_per_epoch` | 500 | Synthetic samples per training epoch |
-| `--val_samples_per_epoch` | 100 | Validation samples per epoch |
-| `--num_workers` | 4 | DataLoader workers |
-| `--patience` | 30 | Early stopping patience (epochs without improvement) |
+| `--precision` | `16-mixed` | Training precision |
 | `--loss_w_seg` | 1.0 | Segmentation BCE loss weight |
-| `--loss_w_volume` | 0.1 | Volume L1 loss weight |
-| `--loss_w_mape` | 0.05 | Volume MAPE loss weight |
 | `--loss_w_flow` | 1.0 | RPF flow velocity MSE loss weight |
-| `--freeze_encoder_after` | -1 | Freeze PointNet++ after this epoch (-1 = never) |
-| `--val_stones` | `stone_11 stone_12` | Stones held out for validation |
-| `--wandb` | off | Enable Weights & Biases logging |
-| `--mlflow` | off | Enable MLflow logging |
+| `--freeze_encoder_after` | -1 | Freeze encoder after this epoch (-1 = never) |
+| `--patience` | 30 | Early stopping patience |
+| `--val_stones` | `stone_11 stone_12` | Validation stones |
 
 ### Inference arguments
 
@@ -419,91 +653,77 @@ Output files:
 | `--sequence` | (required) | Stone ID (e.g., `stone_01`) |
 | `--checkpoint` | (required) | Path to trained `.pt` weights |
 | `--output_dir` | `volume_output` | Output directory |
-| `--use_flow` | off | Enable RPF Euler ODE flow registration |
-| `--flow_steps` | 10 | Number of Euler ODE integration steps |
+| `--flow_steps` | 10 | Euler ODE integration steps |
+| `--poisson_depth` | 9 | Octree depth for Poisson reconstruction |
 | `--device` | `cuda` | Device (`cuda` or `cpu`) |
 
-### Model configuration (StoneVolumeNetConfig)
+### Model configuration (StoneReconNetConfig)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `sa1_npoint` | 2048 | Points after Set Abstraction layer 1 |
-| `sa2_npoint` | 512 | Points after Set Abstraction layer 2 |
-| `sa3_npoint` | 128 | Points after Set Abstraction layer 3 |
-| `feature_dim` | 256 | Encoder output feature dimension |
+| `sa1_npoint` | 2048 | Points after SA layer 1 |
+| `sa2_npoint` | 512 | Points after SA layer 2 |
+| `sa3_npoint` | 128 | Points after SA layer 3 |
+| `feature_dim` | 256 | Encoder feature dimension |
 | `attn_embed_dim` | 256 | Attention embedding dimension |
 | `attn_n_layers` | 4 | Number of DiTLayer attention blocks |
 | `attn_n_heads` | 8 | Number of attention heads |
-| `timestep_sampling` | `u_shaped` | Timestep distribution (`u_shaped` or `uniform`) |
-| `inference_sampling_steps` | 10 | Default Euler ODE steps at inference |
+| `timestep_sampling` | `u_shaped` | Timestep distribution |
+| `inference_sampling_steps` | 10 | Default Euler ODE steps |
 
 ### Loss function
-
-The total loss is a weighted sum of four terms:
 
 ```
 L = w_seg  * BCE(seg_logits, seg_labels)
   + w_flow * MSE(v_pred, v_target)
-  + w_vol  * L1(pred_volume, gt_volume)
-  + w_mape * MAPE(pred_volume, gt_volume)
 ```
 
 | Term | What it supervises | Default weight |
 |------|-------------------|----------------|
 | `seg_loss` | Per-point stone vs background classification | 1.0 |
-| `flow_loss` | Velocity field for point registration (RPF) | 1.0 |
-| `vol_l1` | Absolute volume error in cm3 | 0.1 |
-| `vol_mape` | Relative volume error (%) | 0.05 |
-
-### Data augmentation (training only)
-
-| Augmentation | Default | Description |
-|-------------|---------|-------------|
-| Depth noise | 2mm Gaussian | Added to valid depth pixels before back-projection |
-| Point dropout | 10% | Random point removal per view |
-| Rotation perturbation | 5 degrees | Small random 3D rotation of entire point cloud |
-| Scale jitter | 5% | Random uniform scaling of entire point cloud |
-| Random view count | 4-24 views | Different number of views sampled per training example |
+| `flow_loss` | Velocity field for point cloud registration (RPF) | 1.0 |
 
 ---
 
 ## Key Concepts
 
+### Why geometric volume instead of neural regression?
+
+- A neural network predicting a scalar volume must learn the concept of 3D shape and enclosed space implicitly -- very hard with limited training data
+- Poisson reconstruction creates a watertight surface (including the unseen bottom), from which volume is mathematically exact
+- The network only needs to learn segmentation and registration -- much simpler tasks
+
 ### Turntable camera model
 
-The Blender data uses a fixed camera with the stone rotating on a turntable at 3 degrees per frame. This gives analytically known poses: frame `i` has rotation `R_y(i * 3 deg)` about the Y axis. These known poses provide the GT registered positions used as the flow target `x_0`.
+The Blender data uses a fixed camera with the stone rotating at 3 degrees/frame. Frame `i` has rotation `R_y(i * 3 deg)` about the Y axis. These known poses provide the GT registered positions used as the flow target.
 
 ### Rectified flow (from RPF)
 
-Rectified flow learns a straight-line transport map between two distributions. In our case:
+Learns a straight-line transport map between noise and registered positions:
 
-- **x_0** = GT registered point positions (from turntable poses, pre-augmentation)
-- **x_1** = Gaussian noise (sampled randomly)
-- **x_t** = (1-t) * x_0 + t * x_1 (linear interpolation at timestep t)
-- **v_target** = x_1 - x_0 (constant velocity along the straight line)
+- **x_0** = GT registered positions (from turntable poses, pre-augmentation)
+- **x_1** = Gaussian noise
+- **x_t** = (1-t) * x_0 + t * x_1
+- **v_target** = x_1 - x_0
 
-The model learns to predict this velocity field. At inference, integrating the learned velocity from t=1 to t=0 transports noise into registered positions.
+At inference, integrating the learned velocity from t=1 to t=0 produces the registered cloud.
 
 ### U-shaped timestep sampling
 
-RPF samples timesteps `t` with higher density near 0 and 1 (U-shaped distribution via `asinh` transform). This gives the model more training signal at the boundaries where the flow direction changes most rapidly.
+RPF samples timesteps `t` with higher density near 0 and 1, giving more training signal at the boundaries where the flow direction changes most rapidly.
 
 ### Frozen encoder (two-stage training)
 
-RPF's approach: train everything jointly for N epochs, then freeze the PointNet++ encoder and train only the attention, flow head, and volume head. This prevents the encoder from overfitting on the small dataset while the downstream heads continue to improve. Enable with `--freeze_encoder_after N`.
-
-### GT flow target (gt_points_registered)
-
-The dataset provides `gt_points_registered` -- the clean turntable-aligned point positions **before** data augmentation (rotation perturbation, scale jitter). These serve as the flow learning target `x_0`. The augmented `points` are what the model sees as input, creating a natural mismatch that the flow branch learns to correct.
+Train everything jointly for N epochs, then freeze PointNet++ and train only the attention + flow head. Prevents encoder overfitting on small datasets.
 
 ---
 
 ## References
 
-1. **Rectified Point Flow (RPF)**: Gu, Li, Gao, Porikli, "Rectified Diffusion Guidance for Conditional Generation", NeurIPS 2025 Spotlight. [GitHub](https://github.com/GradientSpaces/Rectified-Point-Flow)
+1. **Rectified Point Flow (RPF)**: NeurIPS 2025 Spotlight. [GitHub](https://github.com/GradientSpaces/Rectified-Point-Flow)
 
-2. **RAP**: Pan, Lim, Vizzo, Stachniss, "RAP: Retrieval-Augmented Point Cloud Registration", NeurIPS 2025. [GitHub](https://github.com/PRBonn/RAP)
+2. **RAP**: Pan et al., NeurIPS 2025. [GitHub](https://github.com/PRBonn/RAP)
 
-3. **PointNet++**: Qi, Yi, Su, Guibas, "PointNet++: Deep Hierarchical Feature Learning on Point Sets in a Metric Space", NeurIPS 2017.
+3. **PointNet++**: Qi et al., NeurIPS 2017.
 
-4. **Flow Matching**: Lipman, Chen, Ben-Hamu, Nickel, Le, "Flow Matching for Generative Modeling", ICLR 2023.
+4. **Flow Matching**: Lipman et al., ICLR 2023.
