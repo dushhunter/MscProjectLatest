@@ -2,6 +2,14 @@
 
 Each sample is a random subset of K depth views from a single stone,
 along with ground-truth segmentation masks and registered point positions.
+
+Supports two types of view sources per stone:
+  1. Turntable views: fixed camera, stone rotates (analytical pose from frame index).
+  2. Random views:    arbitrary camera positions (pose loaded from poses.json).
+
+Both can be combined in training for better surface coverage (especially the
+bottom of the stone which is invisible to turntable captures).
+
 GT volume (from Blender) is optionally included for validation metrics.
 """
 
@@ -12,13 +20,19 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from .prepare_gt import _turntable_rotation_y
+
+
+# Each view entry: (frame_idx, npy_path, pose_4x4_or_None, mask_path_or_None)
+# pose=None means turntable rotation; pose=np.ndarray means explicit extrinsic.
+# mask=None means label all points as stone (no mask available).
+ViewEntry = Tuple[int, str, Optional[np.ndarray], Optional[str]]
 
 
 def _backproject_np(
@@ -50,6 +64,29 @@ def _load_mask_np(path: str, H: int, W: int) -> np.ndarray:
     return (arr > 127).ravel()
 
 
+def _load_poses_json(poses_path: str) -> Dict[int, np.ndarray]:
+    """Load per-view 4x4 camera extrinsic matrices from a JSON file.
+
+    Expected format::
+
+        {
+            "1": [[r00, r01, r02, tx], [r10, r11, r12, ty],
+                   [r20, r21, r22, tz], [0, 0, 0, 1]],
+            "2": [...],
+            ...
+        }
+
+    Keys are frame indices (as strings). Values are 4x4 matrices that
+    transform camera-space points into world space (cam-to-world).
+    """
+    with open(poses_path, "r") as f:
+        data = json.load(f)
+    poses: Dict[int, np.ndarray] = {}
+    for key, mat in data.items():
+        poses[int(key)] = np.array(mat, dtype=np.float64)
+    return poses
+
+
 def _random_rotation_matrix(max_angle_deg: float) -> np.ndarray:
     """Small random 3x3 rotation for augmentation."""
     angles = np.random.uniform(
@@ -64,12 +101,48 @@ def _random_rotation_matrix(max_angle_deg: float) -> np.ndarray:
     return (Rz @ Ry @ Rx).astype(np.float32)
 
 
+def _scan_depth_dir(
+    depth_dir: str,
+    external_poses: Optional[Dict[int, np.ndarray]] = None,
+    mask_dir: Optional[str] = None,
+) -> List[ViewEntry]:
+    """Scan a depth directory and return ViewEntry tuples.
+
+    If *external_poses* is provided, each view gets its explicit 4x4 matrix.
+    Otherwise pose is set to None (caller should use turntable formula).
+    If *mask_dir* is provided, masks are matched to views by frame index.
+    """
+    mask_by_idx: Dict[int, str] = {}
+    if mask_dir and os.path.isdir(mask_dir):
+        for f in sorted(os.listdir(mask_dir)):
+            if f.lower().endswith(".png"):
+                digits = "".join(c for c in Path(f).stem if c.isdigit())
+                if digits:
+                    mask_by_idx[int(digits)] = os.path.join(mask_dir, f)
+
+    entries: List[ViewEntry] = []
+    for f in sorted(os.listdir(depth_dir)):
+        if not f.lower().endswith(".npy"):
+            continue
+        digits = "".join(c for c in Path(f).stem if c.isdigit())
+        if not digits:
+            continue
+        frame_idx = int(digits)
+        pose = external_poses.get(frame_idx) if external_poses else None
+        mask_path = mask_by_idx.get(frame_idx)
+        entries.append((frame_idx, os.path.join(depth_dir, f), pose, mask_path))
+    return entries
+
+
 class StoneReconDataset(Dataset):
     """Dataset that yields random multi-view samples for stone reconstruction.
 
     Each __getitem__ call picks a stone at random, selects K random views,
-    back-projects them to 3D, applies GT masks and turntable transforms,
-    and returns points with segmentation labels and registered positions.
+    back-projects them to 3D, applies GT masks and the appropriate transform
+    (turntable rotation OR explicit pose), and returns points with
+    segmentation labels and registered positions.
+
+    Supports combined turntable + random views per stone.
     GT volume is optionally included for validation metrics.
     """
 
@@ -91,6 +164,7 @@ class StoneReconDataset(Dataset):
         scale_jitter: float = 0.05,
         point_dropout_rate: float = 0.1,
         samples_per_epoch: int = 500,
+        random_views_suffix: str = "_random_npy",
     ):
         super().__init__()
         self.dataset_dir = dataset_dir
@@ -124,47 +198,59 @@ class StoneReconDataset(Dataset):
             K = load_intrinsics(intrinsics_path, sid, width, height)
             self._intrinsics_cache[sid] = (K.fx, K.fy, K.cx, K.cy)
 
-        self._depth_files: Dict[str, List[Tuple[int, str]]] = {}
-        self._mask_files: Dict[str, Dict[int, str]] = {}
+        self._view_entries: Dict[str, List[ViewEntry]] = {}
         for sid in self.stone_ids:
-            depth_dir = os.path.join(dataset_dir, f"{sid}_depth_npy")
-            mask_dir = os.path.join(dataset_dir, sid, "masks")
+            all_views: List[ViewEntry] = []
 
-            npy_files = []
-            for f in sorted(os.listdir(depth_dir)):
-                if f.lower().endswith(".npy"):
-                    digits = "".join(c for c in Path(f).stem if c.isdigit())
-                    if digits:
-                        npy_files.append((int(digits), os.path.join(depth_dir, f)))
-            self._depth_files[sid] = npy_files
+            # 1) Turntable views: masks in stone_XX/masks/
+            turntable_dir = os.path.join(dataset_dir, f"{sid}_depth_npy")
+            turntable_mask_dir = os.path.join(dataset_dir, sid, "masks")
+            if os.path.isdir(turntable_dir):
+                turntable_poses_path = os.path.join(turntable_dir, "poses.json")
+                if os.path.isfile(turntable_poses_path):
+                    tt_poses = _load_poses_json(turntable_poses_path)
+                else:
+                    tt_poses = None
+                all_views.extend(_scan_depth_dir(
+                    turntable_dir, tt_poses, turntable_mask_dir,
+                ))
 
-            mask_map = {}
-            if os.path.isdir(mask_dir):
-                for f in sorted(os.listdir(mask_dir)):
-                    if f.lower().endswith(".png"):
-                        digits = "".join(c for c in Path(f).stem if c.isdigit())
-                        if digits:
-                            mask_map[int(digits)] = os.path.join(mask_dir, f)
-            self._mask_files[sid] = mask_map
+            # 2) Random views: masks in stone_XX_random_npy/masks/
+            random_dir = os.path.join(dataset_dir, f"{sid}{random_views_suffix}")
+            if os.path.isdir(random_dir):
+                random_poses_path = os.path.join(random_dir, "poses.json")
+                random_mask_dir = os.path.join(random_dir, "masks")
+                if os.path.isfile(random_poses_path):
+                    rand_poses = _load_poses_json(random_poses_path)
+                    all_views.extend(_scan_depth_dir(
+                        random_dir, rand_poses, random_mask_dir,
+                    ))
+                else:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Random views dir %s exists but has no poses.json — skipping",
+                        random_dir,
+                    )
+
+            self._view_entries[sid] = all_views
 
     def __len__(self) -> int:
         return self.samples_per_epoch
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         stone_id = random.choice(self.stone_ids)
-        depth_files = self._depth_files[stone_id]
-        masks = self._mask_files[stone_id]
+        view_entries = self._view_entries[stone_id]
         fx, fy, cx, cy = self._intrinsics_cache[stone_id]
 
-        n_available = len(depth_files)
+        n_available = len(view_entries)
         K = random.randint(self.min_views, min(self.max_views, n_available))
-        selected = random.sample(depth_files, K)
+        selected = random.sample(view_entries, K)
 
         all_pts = []
         all_seg_labels = []
         all_view_ids = []
 
-        for view_i, (frame_idx, npy_path) in enumerate(selected):
+        for view_i, (frame_idx, npy_path, pose_4x4, mask_path) in enumerate(selected):
             depth = np.load(npy_path).astype(np.float32)
 
             if self.augment and self.depth_noise_sigma > 0:
@@ -176,16 +262,20 @@ class StoneReconDataset(Dataset):
             if pts_cam.shape[0] == 0:
                 continue
 
-            has_mask = frame_idx in masks
-            if has_mask:
-                mask_flat = _load_mask_np(masks[frame_idx], self.height, self.width)
+            if mask_path is not None:
+                mask_flat = _load_mask_np(mask_path, self.height, self.width)
                 seg_labels = mask_flat[flat_idx].astype(np.float32)
             else:
                 seg_labels = np.ones(pts_cam.shape[0], dtype=np.float32)
 
-            T = _turntable_rotation_y(frame_idx, self.angle_per_frame_deg)
-            R = T[:3, :3].astype(np.float32)
-            pts_world = (R @ pts_cam.T).T
+            if pose_4x4 is not None:
+                R = pose_4x4[:3, :3].astype(np.float32)
+                t = pose_4x4[:3, 3].astype(np.float32)
+                pts_world = (R @ pts_cam.T).T + t
+            else:
+                T = _turntable_rotation_y(frame_idx, self.angle_per_frame_deg)
+                R = T[:3, :3].astype(np.float32)
+                pts_world = (R @ pts_cam.T).T
 
             if self.augment and self.point_dropout_rate > 0:
                 keep = np.random.rand(pts_world.shape[0]) > self.point_dropout_rate
@@ -247,7 +337,7 @@ class StoneReconDataset(Dataset):
 
     def _empty_sample(self) -> Dict[str, torch.Tensor]:
         """Fallback for degenerate cases."""
-        return {
+        sample: Dict[str, Any] = {
             "points": torch.zeros(1, 3),
             "seg_labels": torch.zeros(1),
             "view_ids": torch.zeros(1, dtype=torch.int64),
@@ -255,6 +345,9 @@ class StoneReconDataset(Dataset):
             "stone_id": "",
             "gt_points_registered": torch.zeros(1, 3),
         }
+        if self.volumes:
+            sample["gt_volume"] = torch.tensor(0.0, dtype=torch.float32)
+        return sample
 
 
 def collate_variable_points(batch: List[Dict]) -> Dict[str, torch.Tensor]:

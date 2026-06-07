@@ -116,8 +116,9 @@ class StoneReconLightning(pl.LightningModule):
         losses = self.loss(output, batch)
 
         B = batch["points"].shape[0]
+        prog_keys = {"loss", "seg_iou", "seg_f1"}
         for k, v in losses.items():
-            self.log(f"train/{k}", v, prog_bar=(k == "loss"), batch_size=B)
+            self.log(f"train/{k}", v, prog_bar=(k in prog_keys), batch_size=B)
 
         return losses["loss"]
 
@@ -126,8 +127,9 @@ class StoneReconLightning(pl.LightningModule):
         losses = self.loss(output, batch)
 
         B = batch["points"].shape[0]
+        prog_keys = {"loss", "seg_iou", "seg_f1"}
         for k, v in losses.items():
-            self.log(f"val/{k}", v, prog_bar=(k == "loss"),
+            self.log(f"val/{k}", v, prog_bar=(k in prog_keys),
                      batch_size=B, sync_dist=True)
 
     # ------------------------------------------------------------------
@@ -182,6 +184,7 @@ def build_datasets(
     max_points_per_view: int = 4096,
     train_samples_per_epoch: int = 500,
     val_samples_per_epoch: int = 100,
+    random_views_suffix: str = "_random_npy",
 ) -> tuple:
     train_ds = StoneReconDataset(
         dataset_dir=dataset_dir,
@@ -193,6 +196,7 @@ def build_datasets(
         max_points_per_view=max_points_per_view,
         augment=True,
         samples_per_epoch=train_samples_per_epoch,
+        random_views_suffix=random_views_suffix,
     )
     val_ds = StoneReconDataset(
         dataset_dir=dataset_dir,
@@ -204,6 +208,7 @@ def build_datasets(
         max_points_per_view=max_points_per_view,
         augment=False,
         samples_per_epoch=val_samples_per_epoch,
+        random_views_suffix=random_views_suffix,
     )
     return train_ds, val_ds
 
@@ -249,6 +254,7 @@ def train(
     width: int = 1024,
     height: int = 576,
     freeze_encoder_after: int = -1,
+    random_views_suffix: str = "_random_npy",
 ):
     """Run the full training pipeline."""
     os.makedirs(output_dir, exist_ok=True)
@@ -271,6 +277,7 @@ def train(
         max_points_per_view=max_points_per_view,
         train_samples_per_epoch=train_samples_per_epoch,
         val_samples_per_epoch=val_samples_per_epoch,
+        random_views_suffix=random_views_suffix,
     )
 
     train_loader = DataLoader(
@@ -374,6 +381,7 @@ def train(
         "loss_w_seg": loss_w_seg,
         "loss_w_flow": loss_w_flow,
         "freeze_encoder_after": freeze_encoder_after,
+        "random_views_suffix": random_views_suffix,
     }
     with open(os.path.join(output_dir, "training_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
@@ -415,6 +423,9 @@ def main():
 
     parser.add_argument("--freeze_encoder_after", type=int, default=-1,
                         help="Freeze PointNet++ encoder after this epoch (-1 = never)")
+    parser.add_argument("--random_views_suffix", default="_random_npy",
+                        help="Suffix for random-views directories (default: _random_npy). "
+                             "Set to empty string to disable random views.")
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", default="stone-recon")
@@ -444,6 +455,7 @@ def main():
         width=args.width,
         height=args.height,
         freeze_encoder_after=args.freeze_encoder_after,
+        random_views_suffix=args.random_views_suffix,
     )
 
 

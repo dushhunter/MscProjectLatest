@@ -9,14 +9,24 @@ Pipeline:
 
 No neural volume regression -- all volume computation is geometric.
 
+Supports both turntable views (fixed camera) and random views (arbitrary
+camera positions with poses loaded from poses.json).
+
 Usage:
+    # Turntable views only:
     python predict_stone_volume.py \
         --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
         --intrinsics splits/stone/intrinsics.txt \
         --sequence stone_01 \
-        --checkpoint models/stone_recon_net.pt \
-        --output_dir volume_output/ \
-        --flow_steps 10
+        --checkpoint models/stone_recon_net.pt
+
+    # With additional random views:
+    python predict_stone_volume.py \
+        --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
+        --random_depth_dir stone_syn_dataset/stone_01_random_npy \
+        --intrinsics splits/stone/intrinsics.txt \
+        --sequence stone_01 \
+        --checkpoint models/stone_recon_net.pt
 
 Output:
     - stone_registered.ply        (registered stone point cloud)
@@ -54,7 +64,7 @@ LOG = logging.getLogger("predict_stone_volume")
 
 
 def _load_depth_files(depth_dir: str) -> List[str]:
-    """Find and sort .npy depth files."""
+    """Find and sort .npy depth files (excludes poses.json)."""
     files = sorted(
         os.path.join(depth_dir, f)
         for f in os.listdir(depth_dir)
@@ -65,17 +75,37 @@ def _load_depth_files(depth_dir: str) -> List[str]:
     return files
 
 
+def _load_poses_for_inference(depth_dir: str) -> Optional[Dict[int, np.ndarray]]:
+    """Load poses.json from a depth directory if it exists."""
+    poses_path = os.path.join(depth_dir, "poses.json")
+    if not os.path.isfile(poses_path):
+        return None
+    with open(poses_path, "r") as f:
+        data = json.load(f)
+    return {int(k): np.array(v, dtype=np.float64) for k, v in data.items()}
+
+
 def _prepare_input(
     depth_files: List[str],
     intrinsics: Intrinsics,
     max_points_per_view: int = 4096,
     device: str = "cuda",
-) -> Tuple[Dict[str, torch.Tensor], np.ndarray]:
-    """Load depth files, back-project, and prepare model input."""
+    random_depth_files: Optional[List[str]] = None,
+    random_poses: Optional[Dict[int, np.ndarray]] = None,
+) -> Tuple[Dict[str, torch.Tensor], np.ndarray, int, int]:
+    """Load depth files, back-project, and prepare model input.
+
+    Returns:
+        batch: Model input dict.
+        centroid: Point cloud centroid for de-centering.
+        n_turntable: Number of turntable views loaded.
+        n_random: Number of random views loaded.
+    """
     all_pts = []
     all_view_ids = []
+    view_counter = 0
 
-    for view_i, path in enumerate(depth_files):
+    for path in depth_files:
         depth = np.load(path).astype(np.float32)
         if depth.shape != (intrinsics.height, intrinsics.width):
             LOG.warning("Skipping %s: shape %s", path, depth.shape)
@@ -86,14 +116,39 @@ def _prepare_input(
             continue
 
         pts = pts_cam.astype(np.float32)
-
         if pts.shape[0] > max_points_per_view:
             choice = np.random.choice(pts.shape[0], max_points_per_view, replace=False)
             pts = pts[choice]
 
-        view_id = np.full(pts.shape[0], view_i, dtype=np.int64)
+        view_id = np.full(pts.shape[0], view_counter, dtype=np.int64)
         all_pts.append(pts)
         all_view_ids.append(view_id)
+        view_counter += 1
+
+    n_turntable = view_counter
+
+    n_random = 0
+    if random_depth_files:
+        for path in random_depth_files:
+            depth = np.load(path).astype(np.float32)
+            if depth.shape != (intrinsics.height, intrinsics.width):
+                LOG.warning("Skipping random %s: shape %s", path, depth.shape)
+                continue
+
+            pts_cam, _ = _backproject_full(depth, intrinsics, stride=1)
+            if pts_cam.shape[0] == 0:
+                continue
+
+            pts = pts_cam.astype(np.float32)
+            if pts.shape[0] > max_points_per_view:
+                choice = np.random.choice(pts.shape[0], max_points_per_view, replace=False)
+                pts = pts[choice]
+
+            view_id = np.full(pts.shape[0], view_counter, dtype=np.int64)
+            all_pts.append(pts)
+            all_view_ids.append(view_id)
+            view_counter += 1
+            n_random += 1
 
     if not all_pts:
         raise RuntimeError("No valid points from any depth file")
@@ -112,7 +167,7 @@ def _prepare_input(
         "n_points": torch.tensor([N], dtype=torch.int64, device=device),
     }
 
-    return batch, centroid
+    return batch, centroid, n_turntable, n_random
 
 
 def poisson_mesh(
@@ -250,11 +305,14 @@ def save_results(
     results: Dict,
     output_dir: str,
     depth_dir: str,
-    n_views: int,
+    n_turntable: int,
+    n_random: int,
     elapsed_s: float,
+    random_depth_dir: Optional[str] = None,
 ):
     """Save mesh, point cloud(s), and reports."""
     os.makedirs(output_dir, exist_ok=True)
+    n_views = n_turntable + n_random
 
     flow_pts = results["flow_registered_points"]
     if flow_pts.shape[0] > 0:
@@ -281,8 +339,12 @@ def save_results(
         "StoneReconNet -- Volume Prediction Report",
         "=" * 60,
         "",
-        f"Input:            {depth_dir}",
-        f"Views:            {n_views}",
+        f"Input (turntable): {depth_dir}",
+    ]
+    if random_depth_dir:
+        report_lines.append(f"Input (random):    {random_depth_dir}")
+    report_lines += [
+        f"Views:            {n_views} (turntable={n_turntable}, random={n_random})",
         f"Total points:     {results['n_total_points']}",
         f"Stone points:     {results['n_stone_points']} ({results['seg_ratio']:.1%})",
         f"Flow points:      {results['n_flow_points']}",
@@ -335,9 +397,13 @@ def save_results(
         "seg_ratio": results["seg_ratio"],
         "flow_steps": results["flow_steps"],
         "n_views": n_views,
+        "n_turntable_views": n_turntable,
+        "n_random_views": n_random,
         "inference_time_s": elapsed_s,
         "input_dir": depth_dir,
     }
+    if random_depth_dir:
+        result_json["random_input_dir"] = random_depth_dir
     if mesh is not None:
         result_json["mesh_vertices"] = results["mesh_vertices"]
         result_json["mesh_triangles"] = results["mesh_triangles"]
@@ -352,7 +418,10 @@ def main():
         description="Predict stone volume: neural segmentation + RPF flow registration + Poisson mesh"
     )
     parser.add_argument("--depth_dir", required=True,
-                        help="Directory with sparse .npy depth files")
+                        help="Directory with turntable .npy depth files")
+    parser.add_argument("--random_depth_dir", default=None,
+                        help="Optional directory with random-view .npy depth files "
+                             "(must contain poses.json with per-view 4x4 extrinsics)")
     parser.add_argument("--intrinsics", required=True,
                         help="Path to intrinsics.txt")
     parser.add_argument("--sequence", required=True,
@@ -386,13 +455,28 @@ def main():
     K = load_intrinsics(args.intrinsics, args.sequence, args.width, args.height)
 
     depth_files = _load_depth_files(args.depth_dir)
-    LOG.info("Found %d depth files in %s", len(depth_files), args.depth_dir)
+    LOG.info("Found %d turntable depth files in %s", len(depth_files), args.depth_dir)
+
+    random_depth_files = None
+    random_poses = None
+    if args.random_depth_dir:
+        random_depth_files = _load_depth_files(args.random_depth_dir)
+        random_poses = _load_poses_for_inference(args.random_depth_dir)
+        LOG.info("Found %d random-view depth files in %s",
+                 len(random_depth_files), args.random_depth_dir)
+        if random_poses:
+            LOG.info("Loaded %d poses from poses.json", len(random_poses))
+        else:
+            LOG.warning("No poses.json found in %s — random views will be treated "
+                        "as unposed (model must handle registration)", args.random_depth_dir)
 
     LOG.info("Preparing input...")
-    batch, centroid = _prepare_input(
+    batch, centroid, n_turntable, n_random = _prepare_input(
         depth_files, K,
         max_points_per_view=args.max_points_per_view,
         device=args.device,
+        random_depth_files=random_depth_files,
+        random_poses=random_poses,
     )
 
     LOG.info("Running inference (RPF flow + Poisson mesh)...")
@@ -404,7 +488,11 @@ def main():
     )
     elapsed = time.perf_counter() - t0
 
-    save_results(results, args.output_dir, args.depth_dir, len(depth_files), elapsed)
+    save_results(
+        results, args.output_dir, args.depth_dir,
+        n_turntable, n_random, elapsed,
+        random_depth_dir=args.random_depth_dir,
+    )
     LOG.info("Done.")
 
 

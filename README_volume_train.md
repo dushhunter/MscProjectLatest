@@ -45,9 +45,9 @@ Multi-view depth maps
     Watertight mesh --> mesh.get_volume()
 ```
 
-**Training data**: 12 synthetic stones rendered in Blender, 120 turntable views each (3 degrees/frame), with ground-truth segmentation masks. GT volumes from Blender are used for validation only.
+**Training data**: 12 synthetic stones rendered in Blender, 120 turntable views each (3 degrees/frame) + optional 30-40 random views with varied camera angles (for full surface coverage including the bottom). GT volumes from Blender are used for validation only.
 
-**Inference**: Works with sparse views (e.g., 24 out of 120). Produces a 3D mesh and geometric volume.
+**Inference**: Works with sparse views (e.g., 18 turntable + 6-10 random-angle views). Produces a 3D mesh and geometric volume.
 
 **Hardware**: Designed for NVIDIA RTX 4080 16GB with fp16 mixed precision.
 
@@ -55,7 +55,30 @@ Multi-view depth maps
 
 ## Pipeline Visualization
 
-### End-to-End Inference Pipeline
+### Animated Pipeline Overview
+
+**Conceptual pipeline:**
+
+![StoneReconNet Pipeline](docs/pipeline_flow.gif)
+
+**Real data pipeline (stone_01, 18 sparse views):**
+
+![Real Data Pipeline](docs/pipeline_real_stone01.gif)
+
+### End-to-End Inference Pipeline (step by step)
+
+| Step | Visualization |
+|------|---------------|
+| **1. Input depth maps** | ![Step 1](docs/step_1.png) |
+| **2. Back-project to 3D** | ![Step 2](docs/step_2.png) |
+| **3. Neural segmentation** | ![Step 3](docs/step_3.png) |
+| **4. Multi-view fusion** | ![Step 4](docs/step_4.png) |
+| **5. RPF flow registration** | ![Step 5](docs/step_5.png) |
+| **6. Poisson mesh** | ![Step 6](docs/step_6.png) |
+| **7. Geometric volume** | ![Step 7](docs/step_7.png) |
+| **Full pipeline summary** | ![Summary](docs/step_8.png) |
+
+### Detailed Text Diagrams
 
 The complete flow from raw depth maps to measured volume:
 
@@ -373,15 +396,16 @@ Poisson reconstruction creates a watertight surface (including the unseen bottom
 ```
 volume_estimation/
     __init__.py
-    encoder.py        # PointNet++ encoder (FPS, ball query, SA layers)
-    attention.py       # Multi-view attention (DiTLayer, position encoding)
-    model.py           # StoneReconNet (PointNet++ + SegHead + Attention + FlowHead)
-    loss.py            # Segmentation BCE + flow velocity MSE
-    dataset.py         # StoneReconDataset with augmentation + GT flow targets
-    train.py           # PyTorch Lightning training script
-    prepare_gt.py      # Generate GT volumes via voxelization/convex hull
+    encoder.py          # PointNet++ encoder (FPS, ball query, SA layers)
+    attention.py         # Multi-view attention (DiTLayer, position encoding)
+    model.py             # StoneReconNet (PointNet++ + SegHead + Attention + FlowHead)
+    loss.py              # Segmentation BCE + flow velocity MSE
+    dataset.py           # StoneReconDataset (turntable + random views, augmentation)
+    train.py             # PyTorch Lightning training script
+    prepare_gt.py        # Generate GT volumes via voxelization/convex hull
 
-predict_stone_volume.py  # CLI: model -> Poisson mesh -> volume
+predict_stone_volume.py          # CLI: model -> Poisson mesh -> volume
+blender_export_random_views.py   # Blender script: render depth + poses from random angles
 ```
 
 ---
@@ -444,14 +468,53 @@ print(f"Volume: {volume * 1e6:.4f} cm3")
 bm.free()
 ```
 
-### 3. Expected dataset layout
+### 3. Generate random-view depth maps (for bottom coverage)
+
+Turntable views only see the sides and top of the stone -- the bottom (where it sits on the flat surface) is never visible. To capture the full surface, render 30-40 depth maps from random camera positions with varied elevation angles (including views from below).
+
+Run the Blender export script:
+
+```bash
+blender --background scene.blend --python blender_export_random_views.py -- \
+    --stone_name stone_01 \
+    --output_dir stone_syn_dataset/stone_01_random_npy \
+    --n_views 30 \
+    --elev_min -30 \
+    --elev_max 80 \
+    --seed 42
+```
+
+This creates:
+- `stone_01_random_npy/depth_0001.npy` ... `depth_0030.npy` (depth maps)
+- `stone_01_random_npy/poses.json` (per-view 4x4 camera-to-world extrinsics)
+
+Repeat for each stone.
+
+**Why both turntable + random?**
+
+| | Turntable (120 views) | Random (30-40 views) |
+|---|---|---|
+| Side coverage | Excellent (3° spacing) | Good |
+| Bottom coverage | None | Excellent |
+| Pose accuracy | Analytical (exact) | From Blender (exact) |
+| View overlap | Very high (redundant) | Variable |
+| Result | Good for segmentation training | Critical for accurate volume |
+
+Combined training gives the model both dense side coverage AND bottom coverage.
+
+### 4. Expected dataset layout
 
 ```
 stone_syn_dataset/
-    stone_01_depth_npy/       # 120 depth files
+    stone_01_depth_npy/       # 120 turntable depth files
+    stone_01_random_npy/      # 30-40 random-view depth files (optional)
+        poses.json            # per-view 4x4 camera-to-world matrices
+        masks/                # segmentation masks (optional)
     stone_01/
-        masks/                # 120 mask PNGs
+        masks/                # 120 turntable mask PNGs
     stone_02_depth_npy/
+    stone_02_random_npy/
+        poses.json
     stone_02/
         masks/
     ...
@@ -466,7 +529,7 @@ Training teaches the model two tasks:
 1. **Segmentation**: which points are stone vs floor/background (BCE loss)
 2. **Registration**: how to align multi-view point clouds (flow velocity MSE loss)
 
-### Basic training command
+### Basic training command (turntable views only)
 
 ```bash
 ./venv/bin/python -m volume_estimation.train \
@@ -482,6 +545,28 @@ Training teaches the model two tasks:
   --loss_w_flow 1.0 \
   --patience 30
 ```
+
+### Training with combined turntable + random views (recommended)
+
+If you have generated random-view data (see Data Preparation step 3), it is automatically detected and combined with turntable views:
+
+```bash
+./venv/bin/python -m volume_estimation.train \
+  --dataset_dir stone_syn_dataset \
+  --volumes_json stone_volumes_gt.json \
+  --intrinsics splits/stone/intrinsics.txt \
+  --output_dir volume_training_output_combined \
+  --max_epochs 200 \
+  --batch_size 4 \
+  --lr 1e-3 \
+  --precision 16-mixed \
+  --loss_w_seg 1.0 \
+  --loss_w_flow 1.0 \
+  --patience 30 \
+  --random_views_suffix _random_npy
+```
+
+The dataset automatically detects `stone_XX_random_npy/` directories next to `stone_XX_depth_npy/`. Each batch randomly samples from the combined pool of turntable + random views, so the model learns to handle both view types.
 
 ### Two-stage training (freeze encoder after warmup)
 
@@ -565,7 +650,7 @@ Model checkpoint + sparse depth maps
   [3] mesh.get_volume() -> geometric volume in cm3
 ```
 
-### Inference command
+### Inference command (turntable views only)
 
 ```bash
 ./venv/bin/python predict_stone_volume.py \
@@ -576,6 +661,19 @@ Model checkpoint + sparse depth maps
   --output_dir volume_output/stone_01 \
   --flow_steps 10 \
   --poisson_depth 9
+```
+
+### Inference with turntable + random views (recommended for better bottom coverage)
+
+```bash
+./venv/bin/python predict_stone_volume.py \
+  --depth_dir stone_syn_dataset/stone_01_sparse_npy_n24 \
+  --random_depth_dir stone_syn_dataset/stone_01_random_npy \
+  --intrinsics splits/stone/intrinsics.txt \
+  --sequence stone_01 \
+  --checkpoint volume_training_output/stone_recon_net.pt \
+  --output_dir volume_output/stone_01 \
+  --flow_steps 10
 ```
 
 ### Inference output
@@ -643,12 +741,14 @@ Output files:
 | `--freeze_encoder_after` | -1 | Freeze encoder after this epoch (-1 = never) |
 | `--patience` | 30 | Early stopping patience |
 | `--val_stones` | `stone_11 stone_12` | Validation stones |
+| `--random_views_suffix` | `_random_npy` | Suffix for random-view directories |
 
 ### Inference arguments
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--depth_dir` | (required) | Directory with sparse `.npy` depth files |
+| `--depth_dir` | (required) | Directory with turntable `.npy` depth files |
+| `--random_depth_dir` | (none) | Optional directory with random-view `.npy` files (must contain `poses.json`) |
 | `--intrinsics` | (required) | Path to `intrinsics.txt` |
 | `--sequence` | (required) | Stone ID (e.g., `stone_01`) |
 | `--checkpoint` | (required) | Path to trained `.pt` weights |
@@ -696,6 +796,22 @@ L = w_seg  * BCE(seg_logits, seg_labels)
 ### Turntable camera model
 
 The Blender data uses a fixed camera with the stone rotating at 3 degrees/frame. Frame `i` has rotation `R_y(i * 3 deg)` about the Y axis. These known poses provide the GT registered positions used as the flow target.
+
+### Random views (for bottom coverage)
+
+Turntable views never see the bottom of the stone. Random views place the camera at arbitrary azimuth + elevation angles (including below the equator), providing depth data for the bottom surface. Each random view stores its 4x4 camera-to-world matrix in `poses.json`. Combined with turntable views, this gives complete surface coverage for accurate volume measurement.
+
+```
+Turntable views:             Random views:
+  fixed elevation              varied elevation
+
+     camera                    camera positions:
+       |                         ·   ·   ·
+  ─────┼─────  equator        ·  [stone]  ·
+       |                         ·   ·   ·
+   [stone]                    ← includes below
+                                 equator!
+```
 
 ### Rectified flow (from RPF)
 

@@ -62,22 +62,91 @@ class StoneReconNetConfig:
     flow_loss_type: str = "mse"
     timestep_sampling: str = "u_shaped"
     inference_sampling_steps: int = 10
+    t_embed_dim: int = 64
+
+
+class SinusoidalTimestepEmbedding(nn.Module):
+    """Sinusoidal timestep embedding followed by a learnable MLP (DDPM / RPF style).
+
+    Maps a scalar timestep t in [0, 1] to a high-dimensional vector that the
+    flow head can use to modulate its velocity prediction at different points
+    along the ODE trajectory.
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) scalar timesteps -> (B, dim) embeddings."""
+        half = self.dim // 2
+        freqs = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(half, device=t.device, dtype=t.dtype)
+            / half
+        )
+        args = t.unsqueeze(-1) * freqs.unsqueeze(0)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        if self.dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return self.mlp(emb)
 
 
 class FlowHead(nn.Module):
-    """Predicts 3D velocity field from attention features (RPF-style)."""
+    """Predicts 3D velocity field conditioned on position, timestep, and
+    attention features (proper RPF-style).
 
-    def __init__(self, embed_dim: int):
+    Unlike a naive flow head that only sees encoded features, this module
+    receives three inputs at each ODE step:
+      - features: (B, M, D) fused multi-view attention features (constant
+        across steps -- computed once by the encoder + attention stack).
+      - x_t: (B, M, 3) current point positions along the flow trajectory.
+        At t=1 this is pure noise; at t=0 it should be the registered cloud.
+      - t: (B,) scalar timestep in [0, 1].
+
+    This lets the model learn position-dependent velocity: given where points
+    ARE right now (x_t) and how far along the trajectory we are (t), predict
+    which direction they should move. Multi-step Euler integration then
+    iteratively refines the positions from noise toward registration.
+    """
+
+    def __init__(self, embed_dim: int, t_embed_dim: int = 64):
         super().__init__()
+        self.t_embed = SinusoidalTimestepEmbedding(t_embed_dim)
+        input_dim = embed_dim + 3 + t_embed_dim
         self.net = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(input_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, 3),
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 3),
         )
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """(B, M, D) -> (B, M, 3) velocity prediction."""
-        return self.net(features)
+    def forward(
+        self,
+        features: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            features: (B, M, D) fused multi-view features.
+            x_t: (B, M, 3) current flow positions.
+            t: (B,) timestep scalars in [0, 1].
+
+        Returns:
+            (B, M, 3) predicted velocity at this (x_t, t).
+        """
+        B, M, _ = features.shape
+        t_emb = self.t_embed(t).unsqueeze(1).expand(-1, M, -1)
+        combined = torch.cat([features, x_t, t_emb], dim=-1)
+        return self.net(combined)
 
 
 class StoneReconNet(nn.Module):
@@ -130,7 +199,10 @@ class StoneReconNet(nn.Module):
             dropout=cfg.attn_dropout,
         )
 
-        self.flow_head = FlowHead(embed_dim=cfg.attn_embed_dim)
+        self.flow_head = FlowHead(
+            embed_dim=cfg.attn_embed_dim,
+            t_embed_dim=cfg.t_embed_dim,
+        )
 
         self.timestep_sampling = cfg.timestep_sampling
         self.flow_loss_type = cfg.flow_loss_type
@@ -220,7 +292,7 @@ class StoneReconNet(nn.Module):
             x_1 = torch.randn_like(x_0_sa)
             x_t, v_t = self._compute_flow_target(x_0_sa, x_1, timesteps)
 
-            v_pred = self.flow_head(fused)
+            v_pred = self.flow_head(fused, x_t, timesteps)
 
             output["v_pred"] = v_pred
             output["v_t"] = v_t
@@ -267,6 +339,10 @@ class StoneReconNet(nn.Module):
         Integrates from t=1 (noise) toward t=0 (registered) to produce
         the registered point cloud at the SA level.
 
+        At each step the flow head sees the CURRENT position x_t and the
+        CURRENT timestep t, allowing position-dependent velocity prediction
+        that iteratively refines the point cloud toward registration.
+
         Returns:
             registered_points: (B, M, 3) registered point positions.
             seg_logits: (B, N) per-point segmentation logits.
@@ -283,7 +359,9 @@ class StoneReconNet(nn.Module):
         dt = 1.0 / num_steps
 
         for step in range(num_steps):
-            v_pred = self.flow_head(fused)
+            t_val = 1.0 - step * dt
+            t_tensor = torch.full((B,), t_val, device=sa_xyz.device)
+            v_pred = self.flow_head(fused, x_t, t_tensor)
             x_t = x_t - v_pred * dt
 
         return x_t, inf_out["seg_logits"]

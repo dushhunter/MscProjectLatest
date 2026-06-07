@@ -71,9 +71,32 @@ class StoneReconLoss(nn.Module):
             seg_probs = torch.sigmoid(output["seg_logits"])
             valid = ~batch["pad_mask"]
             pred_seg = (seg_probs > 0.5).float()
-            correct = ((pred_seg == batch["seg_labels"]) & valid).sum()
+            gt_seg = batch["seg_labels"]
+
+            pred_valid = pred_seg[valid]
+            gt_valid = gt_seg[valid]
             n_valid = valid.sum().clamp(min=1)
+
+            correct = (pred_valid == gt_valid).sum()
             losses["seg_acc"] = (correct.float() / n_valid.float()).detach()
+
+            tp = ((pred_valid == 1) & (gt_valid == 1)).sum().float()
+            fp = ((pred_valid == 1) & (gt_valid == 0)).sum().float()
+            fn = ((pred_valid == 0) & (gt_valid == 1)).sum().float()
+            tn = ((pred_valid == 0) & (gt_valid == 0)).sum().float()
+
+            precision = tp / (tp + fp).clamp(min=1)
+            recall = tp / (tp + fn).clamp(min=1)
+            f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-6)
+            iou = tp / (tp + fp + fn).clamp(min=1)
+
+            losses["seg_precision"] = precision.detach()
+            losses["seg_recall"] = recall.detach()
+            losses["seg_f1"] = f1.detach()
+            losses["seg_iou"] = iou.detach()
+
+            stone_ratio = gt_valid.sum().float() / n_valid.float()
+            losses["seg_stone_ratio"] = stone_ratio.detach()
 
         return losses
 

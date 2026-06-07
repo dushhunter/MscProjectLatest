@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Generate ground-truth registered point clouds and volumes for training.
 
-For each stone (turntable capture with known 3-degree/frame rotation):
-  1. Load all 120 depth maps (.npy) and binary masks (.png).
+For each stone:
+  1. Load all depth maps (.npy) from turntable + random view directories.
   2. Back-project each depth map to 3D using camera intrinsics.
-  3. Apply the known turntable rotation (frame_i -> i * 3 degrees about Y).
+  3. Apply the known pose:
+     - Turntable views: analytical rotation (frame_i * 3° about Y).
+     - Random views:    4x4 extrinsic from poses.json.
   4. Keep only stone pixels (from Blender mask).
   5. Merge all views into a single dense registered point cloud.
   6. Compute the ground-truth volume via voxelization.
@@ -89,38 +91,32 @@ def _compute_volume_convex_hull(points: np.ndarray) -> float:
         return 0.0
 
 
-def process_one_stone(
-    stone_id: str,
-    depth_npy_dir: str,
-    mask_dir: str,
-    intrinsics: Intrinsics,
-    output_dir: str,
-    angle_per_frame_deg: float = 3.0,
-    voxel_downsample_m: float = 0.0005,
-    voxel_volume_mm: float = 0.5,
-) -> Dict:
-    """Process one stone: register all views and compute GT volume."""
-    LOG.info("Processing %s ...", stone_id)
+def _load_poses_json(poses_path: str) -> Dict[int, np.ndarray]:
+    """Load per-view 4x4 camera extrinsic matrices from poses.json."""
+    with open(poses_path, "r") as f:
+        data = json.load(f)
+    return {int(k): np.array(v, dtype=np.float64) for k, v in data.items()}
 
+
+def _process_depth_dir(
+    depth_dir: str,
+    mask_by_index: Dict[int, str],
+    intrinsics: Intrinsics,
+    poses: Optional[Dict[int, np.ndarray]],
+    angle_per_frame_deg: float,
+) -> Tuple[List[np.ndarray], int]:
+    """Process all depth files in a directory, returning stone points and count.
+
+    Args:
+        poses: If provided, use explicit 4x4 matrices; otherwise turntable rotation.
+    """
     npy_files = sorted(
-        f for f in os.listdir(depth_npy_dir)
+        f for f in os.listdir(depth_dir)
         if f.lower().endswith(".npy")
     )
-    mask_files = sorted(
-        f for f in os.listdir(mask_dir)
-        if f.lower().endswith(".png")
-    )
-    LOG.info("  Found %d depth files, %d mask files", len(npy_files), len(mask_files))
-
-    mask_by_index = {}
-    for mf in mask_files:
-        stem = Path(mf).stem
-        digits = "".join(c for c in stem if c.isdigit())
-        if digits:
-            mask_by_index[int(digits)] = os.path.join(mask_dir, mf)
 
     all_stone_pts: List[np.ndarray] = []
-    n_views_used = 0
+    n_views = 0
 
     for npy_file in npy_files:
         stem = Path(npy_file).stem
@@ -129,7 +125,7 @@ def process_one_stone(
             continue
         frame_idx = int(digits)
 
-        depth = np.load(os.path.join(depth_npy_dir, npy_file)).astype(np.float32)
+        depth = np.load(os.path.join(depth_dir, npy_file)).astype(np.float32)
         if depth.shape != (intrinsics.height, intrinsics.width):
             LOG.warning("  Skipping %s: shape %s != expected", npy_file, depth.shape)
             continue
@@ -151,19 +147,99 @@ def process_one_stone(
         if pts_stone.shape[0] < 10:
             continue
 
-        T = _turntable_rotation_y(frame_idx, angle_per_frame_deg)
-        R = T[:3, :3]
-        pts_world = (R @ pts_stone.T).T
+        if poses is not None and frame_idx in poses:
+            R = poses[frame_idx][:3, :3]
+            t = poses[frame_idx][:3, 3]
+            pts_world = (R @ pts_stone.T).T + t
+        else:
+            T = _turntable_rotation_y(frame_idx, angle_per_frame_deg)
+            R = T[:3, :3]
+            pts_world = (R @ pts_stone.T).T
 
         all_stone_pts.append(pts_world)
-        n_views_used += 1
+        n_views += 1
+
+    return all_stone_pts, n_views
+
+
+def process_one_stone(
+    stone_id: str,
+    depth_npy_dir: str,
+    mask_dir: str,
+    intrinsics: Intrinsics,
+    output_dir: str,
+    angle_per_frame_deg: float = 3.0,
+    voxel_downsample_m: float = 0.0005,
+    voxel_volume_mm: float = 0.5,
+    random_views_dir: Optional[str] = None,
+    random_masks_dir: Optional[str] = None,
+) -> Dict:
+    """Process one stone: register all views and compute GT volume.
+
+    Supports turntable views (analytical pose) and optional random views
+    (explicit poses from poses.json in the random views directory).
+    """
+    LOG.info("Processing %s ...", stone_id)
+
+    mask_files = sorted(
+        f for f in os.listdir(mask_dir)
+        if f.lower().endswith(".png")
+    ) if os.path.isdir(mask_dir) else []
+
+    mask_by_index: Dict[int, str] = {}
+    for mf in mask_files:
+        stem = Path(mf).stem
+        digits = "".join(c for c in stem if c.isdigit())
+        if digits:
+            mask_by_index[int(digits)] = os.path.join(mask_dir, mf)
+
+    # Also load masks from random views directory
+    if random_masks_dir and os.path.isdir(random_masks_dir):
+        for mf in sorted(os.listdir(random_masks_dir)):
+            if mf.lower().endswith(".png"):
+                stem = Path(mf).stem
+                digits = "".join(c for c in stem if c.isdigit())
+                if digits:
+                    mask_by_index[int(digits)] = os.path.join(random_masks_dir, mf)
+
+    all_stone_pts: List[np.ndarray] = []
+    n_views_turntable = 0
+    n_views_random = 0
+
+    # 1) Turntable views
+    if os.path.isdir(depth_npy_dir):
+        turntable_poses_path = os.path.join(depth_npy_dir, "poses.json")
+        tt_poses = _load_poses_json(turntable_poses_path) if os.path.isfile(turntable_poses_path) else None
+        pts_list, n = _process_depth_dir(
+            depth_npy_dir, mask_by_index, intrinsics, tt_poses, angle_per_frame_deg,
+        )
+        all_stone_pts.extend(pts_list)
+        n_views_turntable = n
+        LOG.info("  Turntable: %d views processed", n)
+
+    # 2) Random views
+    if random_views_dir and os.path.isdir(random_views_dir):
+        random_poses_path = os.path.join(random_views_dir, "poses.json")
+        if os.path.isfile(random_poses_path):
+            rand_poses = _load_poses_json(random_poses_path)
+            pts_list, n = _process_depth_dir(
+                random_views_dir, mask_by_index, intrinsics, rand_poses, angle_per_frame_deg,
+            )
+            all_stone_pts.extend(pts_list)
+            n_views_random = n
+            LOG.info("  Random: %d views processed", n)
+        else:
+            LOG.warning("  Random views dir %s has no poses.json — skipping", random_views_dir)
+
+    n_views_used = n_views_turntable + n_views_random
 
     if not all_stone_pts:
         LOG.warning("  No valid views for %s", stone_id)
         return {"stone_id": stone_id, "volume_mm3": 0.0, "volume_cm3": 0.0, "n_points": 0}
 
     merged_pts = np.concatenate(all_stone_pts, axis=0)
-    LOG.info("  Merged %d points from %d views", merged_pts.shape[0], n_views_used)
+    LOG.info("  Merged %d points from %d views (turntable=%d, random=%d)",
+             merged_pts.shape[0], n_views_used, n_views_turntable, n_views_random)
 
     pcd = make_pcd(merged_pts, estimate_normals=False)
     pcd = pcd.voxel_down_sample(voxel_downsample_m)
@@ -200,6 +276,8 @@ def process_one_stone(
         "volume_hull_mm3": round(vol_hull, 2),
         "n_points": final_pts.shape[0],
         "n_views": n_views_used,
+        "n_views_turntable": n_views_turntable,
+        "n_views_random": n_views_random,
         "ply_path": ply_path,
     }
 
@@ -229,6 +307,11 @@ def main():
     parser.add_argument("--angle_deg", type=float, default=3.0)
     parser.add_argument("--voxel_downsample_mm", type=float, default=0.5)
     parser.add_argument("--voxel_volume_mm", type=float, default=0.5)
+    parser.add_argument(
+        "--random_views_suffix", default="_random_npy",
+        help="Suffix for random-views directories (e.g. stone_01_random_npy). "
+             "Each must contain poses.json with per-view 4x4 extrinsics.",
+    )
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
@@ -240,7 +323,7 @@ def main():
     else:
         stone_ids = []
         for name in sorted(os.listdir(dataset_dir)):
-            if name.startswith("stone_") and "_depth_npy" not in name and "_sparse" not in name:
+            if name.startswith("stone_") and "_depth_npy" not in name and "_sparse" not in name and "_random" not in name:
                 full = os.path.join(dataset_dir, name)
                 if os.path.isdir(full):
                     stone_ids.append(name)
@@ -254,13 +337,16 @@ def main():
     for sid in stone_ids:
         depth_dir = os.path.join(dataset_dir, f"{sid}_depth_npy")
         mask_dir = os.path.join(dataset_dir, sid, "masks")
+        random_dir = os.path.join(dataset_dir, f"{sid}{args.random_views_suffix}")
+        random_masks = os.path.join(random_dir, "masks")
 
         if not os.path.isdir(depth_dir):
             LOG.warning("Depth dir not found: %s — skipping %s", depth_dir, sid)
             continue
-        if not os.path.isdir(mask_dir):
-            LOG.warning("Mask dir not found: %s — skipping %s", mask_dir, sid)
-            continue
+
+        has_random = os.path.isdir(random_dir)
+        if has_random:
+            LOG.info("Found random views directory: %s", random_dir)
 
         K = load_intrinsics(args.intrinsics, sid, args.width, args.height)
         info = process_one_stone(
@@ -272,6 +358,8 @@ def main():
             angle_per_frame_deg=args.angle_deg,
             voxel_downsample_m=args.voxel_downsample_mm * 1e-3,
             voxel_volume_mm=args.voxel_volume_mm,
+            random_views_dir=random_dir if has_random else None,
+            random_masks_dir=random_masks if has_random and os.path.isdir(random_masks) else None,
         )
         results[sid] = info
 
