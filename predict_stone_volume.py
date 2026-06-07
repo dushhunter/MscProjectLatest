@@ -247,9 +247,15 @@ def predict(
     flow_steps: int = 10,
     poisson_depth: int = 9,
 ) -> Dict:
-    """Full inference: segment -> RPF registration -> Poisson mesh -> volume.
+    """Full inference: segment -> Poisson mesh -> volume.
 
-    Returns dict with registered points, mesh, and geometric volume.
+    The segmentation head identifies stone points from the full-resolution
+    input (tens of thousands of points). These segmented points are used
+    directly for Poisson reconstruction, giving a dense, high-quality mesh.
+
+    The flow head also produces a registered cloud at the SA3 level (128 pts)
+    which is saved for analysis, but the volume is computed from the much
+    denser segmented cloud.
     """
     model.eval()
 
@@ -280,14 +286,18 @@ def predict(
         "flow_steps": flow_steps,
     }
 
-    if flow_pts.shape[0] < 100:
-        LOG.warning("Too few registered points (%d) for mesh reconstruction", flow_pts.shape[0])
+    mesh_pts = stone_pts_input
+    if mesh_pts.shape[0] < 100:
+        LOG.warning("Too few stone points (%d) for mesh reconstruction", mesh_pts.shape[0])
         results["volume_cm3"] = 0.0
         results["volume_mm3"] = 0.0
         results["mesh"] = None
         return results
 
-    mesh, pcd = poisson_mesh(flow_pts, depth=poisson_depth)
+    LOG.info("Building Poisson mesh from %d segmented stone points "
+             "(flow produced %d SA-level points)", mesh_pts.shape[0], flow_pts.shape[0])
+
+    mesh, pcd = poisson_mesh(mesh_pts, depth=poisson_depth)
 
     volume_cm3 = _mesh_volume_safe(mesh)
 
