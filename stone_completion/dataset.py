@@ -253,9 +253,11 @@ class StoneCompletionDataset(Dataset):
                 continue
 
             frame_idx = _extract_frame_index(dpath)
+            view_center = pts_cam.mean(axis=0)
+            pts_centered = pts_cam - view_center
             T = _turntable_rotation_y(frame_idx, self.angle_per_frame)
             R = T[:3, :3].astype(np.float32)
-            pts_world = (R @ pts_cam.T).T
+            pts_world = (R @ pts_centered.T).T
 
             mask_file = os.path.join(mask_dir, f"mask_{frame_idx:04d}.png")
             if os.path.isfile(mask_file):

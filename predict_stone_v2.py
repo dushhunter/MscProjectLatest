@@ -210,9 +210,11 @@ def predict(
             continue
 
         frame_idx = _extract_frame_index(dpath)
+        view_center = pts_cam.mean(axis=0)
+        pts_centered = pts_cam - view_center
         T = _turntable_rotation_y(frame_idx, 3.0)
         R = T[:3, :3].astype(np.float32)
-        pts_world = (R @ pts_cam.T).T
+        pts_world = (R @ pts_centered.T).T
 
         if pts_world.shape[0] > 4096:
             choice = np.random.choice(pts_world.shape[0], 4096, replace=False)

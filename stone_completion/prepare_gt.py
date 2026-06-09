@@ -189,9 +189,11 @@ def process_stone(
                 t = poses[frame_idx][:3, 3]
                 pts_world = (R @ pts_cam.T).T + t
             else:
+                view_center = pts_cam.mean(axis=0)
+                pts_centered = pts_cam - view_center
                 T = _turntable_rotation_y(frame_idx, angle_deg)
                 R = T[:3, :3]
-                pts_world = (R @ pts_cam.T).T
+                pts_world = (R @ pts_centered.T).T
 
             all_pts.append(pts_world)
             count += 1
