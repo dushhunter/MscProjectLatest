@@ -252,15 +252,18 @@ class StoneReconNet(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Training forward pass: encode, segment, fuse, and compute flow.
+        """Sequential 3-stage training forward pass.
+
+        Stage 1 -- Segmentation: classify stone vs floor per point.
+        Stage 2 -- Alignment:    soft-gated multi-view attention on stone features.
+        Stage 3 -- Completion:   flow head generates complete stone (vs GT2).
 
         Args:
             batch: dict with keys:
-                - points: (B, N, 3) padded point positions
+                - points: (B, N, 3) camera-space points (no pose applied)
                 - view_ids: (B, N) view assignment per point
                 - pad_mask: (B, N) True for padded positions
-                - n_points: (B,) actual number of points per sample
-                - gt_points_registered: (B, N, 3) clean GT positions (flow target)
+                - gt_cloud: (B, K, 3) Blender PLY GT (GT2)
         """
         points = batch["points"]
         view_ids = batch["view_ids"]
@@ -272,11 +275,15 @@ class StoneReconNet(nn.Module):
         seg_logits = self.seg_head(points, sa_xyz, sa_feat)
         seg_logits = seg_logits.masked_fill(pad_mask, 0.0)
 
+        seg_logits_sa = self._downsample_seg_logits(points, sa_xyz, seg_logits)
+        stone_prob_sa = torch.sigmoid(seg_logits_sa).unsqueeze(-1)
+        gated_feat = sa_feat * stone_prob_sa
+
         sa_view_ids = self._downsample_view_ids(points, sa_xyz, view_ids)
         M = sa_xyz.shape[1]
         sa_pad_mask = torch.zeros(B, M, dtype=torch.bool, device=points.device)
 
-        fused = self.multi_view_attn(sa_feat, sa_xyz, sa_view_ids, sa_pad_mask)
+        fused = self.multi_view_attn(gated_feat, sa_xyz, sa_view_ids, sa_pad_mask)
 
         output = {
             "seg_logits": seg_logits,
@@ -284,9 +291,9 @@ class StoneReconNet(nn.Module):
             "sa_xyz": sa_xyz,
         }
 
-        if "gt_points_registered" in batch:
-            gt_reg = batch["gt_points_registered"]
-            x_0_sa = self._downsample_gt_points(points, sa_xyz, gt_reg)
+        if "gt_cloud" in batch:
+            gt_cloud = batch["gt_cloud"]
+            x_0_sa = self._fps_to_sa_size(gt_cloud, M)
 
             timesteps = self._sample_timesteps(B, points.device)
             x_1 = torch.randn_like(x_0_sa)
@@ -315,11 +322,15 @@ class StoneReconNet(nn.Module):
         seg_logits = self.seg_head(points, sa_xyz, sa_feat)
         seg_logits = seg_logits.masked_fill(pad_mask, 0.0)
 
+        seg_logits_sa = self._downsample_seg_logits(points, sa_xyz, seg_logits)
+        stone_prob_sa = torch.sigmoid(seg_logits_sa).unsqueeze(-1)
+        gated_feat = sa_feat * stone_prob_sa
+
         sa_view_ids = self._downsample_view_ids(points, sa_xyz, view_ids)
         M = sa_xyz.shape[1]
         sa_pad_mask = torch.zeros(B, M, dtype=torch.bool, device=points.device)
 
-        fused = self.multi_view_attn(sa_feat, sa_xyz, sa_view_ids, sa_pad_mask)
+        fused = self.multi_view_attn(gated_feat, sa_xyz, sa_view_ids, sa_pad_mask)
 
         return {
             "seg_logits": seg_logits,
@@ -370,6 +381,25 @@ class StoneReconNet(nn.Module):
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _fps_to_sa_size(cloud: torch.Tensor, m: int) -> torch.Tensor:
+        """FPS-downsample a GT cloud (B, K, 3) to (B, M, 3) to match SA3 resolution."""
+        B, K, _ = cloud.shape
+        if K <= m:
+            idx = torch.randint(0, K, (B, m), device=cloud.device)
+            batch_idx = torch.arange(B, device=cloud.device).unsqueeze(1).expand(B, m)
+            return cloud[batch_idx, idx]
+        selected = torch.zeros(B, m, dtype=torch.long, device=cloud.device)
+        selected[:, 0] = torch.randint(0, K, (B,), device=cloud.device)
+        dists = torch.full((B, K), float("inf"), device=cloud.device)
+        for i in range(1, m):
+            last = cloud[torch.arange(B, device=cloud.device), selected[:, i - 1]]
+            d = ((cloud - last.unsqueeze(1)) ** 2).sum(dim=-1)
+            dists = torch.minimum(dists, d)
+            selected[:, i] = dists.argmax(dim=-1)
+        batch_idx = torch.arange(B, device=cloud.device).unsqueeze(1).expand(B, m)
+        return cloud[batch_idx, selected]
+
     def _downsample_view_ids(
         self, xyz_full: torch.Tensor, xyz_sa: torch.Tensor, view_ids: torch.Tensor,
     ) -> torch.Tensor:
@@ -377,6 +407,14 @@ class StoneReconNet(nn.Module):
         dists = torch.cdist(xyz_sa, xyz_full)
         nn_idx = dists.argmin(dim=-1)
         return view_ids.gather(1, nn_idx)
+
+    def _downsample_seg_logits(
+        self, xyz_full: torch.Tensor, xyz_sa: torch.Tensor, seg_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Propagate per-point seg logits to SA-level via nearest neighbor."""
+        dists = torch.cdist(xyz_sa, xyz_full)
+        nn_idx = dists.argmin(dim=-1)
+        return seg_logits.gather(1, nn_idx)
 
     def _downsample_gt_points(
         self, xyz_full: torch.Tensor, xyz_sa: torch.Tensor, gt_full: torch.Tensor,
