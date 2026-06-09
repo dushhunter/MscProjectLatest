@@ -185,6 +185,7 @@ def build_datasets(
     train_samples_per_epoch: int = 500,
     val_samples_per_epoch: int = 100,
     random_views_suffix: str = "_random_npy",
+    gt_cloud_dir: Optional[str] = None,
 ) -> tuple:
     train_ds = StoneReconDataset(
         dataset_dir=dataset_dir,
@@ -197,6 +198,7 @@ def build_datasets(
         augment=True,
         samples_per_epoch=train_samples_per_epoch,
         random_views_suffix=random_views_suffix,
+        gt_cloud_dir=gt_cloud_dir,
     )
     val_ds = StoneReconDataset(
         dataset_dir=dataset_dir,
@@ -209,6 +211,7 @@ def build_datasets(
         augment=False,
         samples_per_epoch=val_samples_per_epoch,
         random_views_suffix=random_views_suffix,
+        gt_cloud_dir=gt_cloud_dir,
     )
     return train_ds, val_ds
 
@@ -255,6 +258,7 @@ def train(
     height: int = 576,
     freeze_encoder_after: int = -1,
     random_views_suffix: str = "_random_npy",
+    gt_cloud_dir: Optional[str] = None,
 ):
     """Run the full training pipeline."""
     os.makedirs(output_dir, exist_ok=True)
@@ -278,6 +282,7 @@ def train(
         train_samples_per_epoch=train_samples_per_epoch,
         val_samples_per_epoch=val_samples_per_epoch,
         random_views_suffix=random_views_suffix,
+        gt_cloud_dir=gt_cloud_dir,
     )
 
     train_loader = DataLoader(
@@ -426,6 +431,11 @@ def main():
     parser.add_argument("--random_views_suffix", default="_random_npy",
                         help="Suffix for random-views directories (default: _random_npy). "
                              "Set to empty string to disable random views.")
+    parser.add_argument("--gt_cloud_dir", default=None,
+                        help="Directory with Blender-exported GT stone point clouds "
+                             "(stone_XX_gt_pointcloud.ply). When provided, the model "
+                             "learns to reconstruct the complete Blender stone shape "
+                             "instead of using turntable-merged depth as GT.")
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", default="stone-recon")
@@ -456,6 +466,7 @@ def main():
         height=args.height,
         freeze_encoder_after=args.freeze_encoder_after,
         random_views_suffix=args.random_views_suffix,
+        gt_cloud_dir=args.gt_cloud_dir,
     )
 
 

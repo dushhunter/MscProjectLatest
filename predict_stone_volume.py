@@ -55,6 +55,8 @@ import open3d as o3d  # noqa: E402
 from neural_pipeline.geometry import (  # noqa: E402
     Intrinsics,
     _backproject_full,
+    detect_floor_normal,
+    floor_up_rotation,
     load_intrinsics,
     make_pcd,
 )
@@ -118,6 +120,17 @@ def _prepare_input(
     all_view_ids = []
     view_counter = 0
 
+    R_fu: Optional[np.ndarray] = None
+    try:
+        d0 = np.load(depth_files[0]).astype(np.float32)
+        pts0, _ = _backproject_full(d0, intrinsics, stride=2)
+        if pts0.shape[0] > 100:
+            n_floor, _ = detect_floor_normal(pts0)
+            R_fu = floor_up_rotation(n_floor).astype(np.float32)
+            LOG.info("Floor-up rotation detected")
+    except Exception as e:
+        LOG.warning("Floor detection failed: %s", e)
+
     view_centroids = []
     for path in depth_files:
         depth = np.load(path).astype(np.float32)
@@ -130,6 +143,8 @@ def _prepare_input(
             continue
 
         pts = pts_cam.astype(np.float32)
+        if R_fu is not None:
+            pts = (R_fu @ pts.T).T
         view_centroids.append(pts.mean(axis=0))
 
     if view_centroids:
@@ -147,11 +162,13 @@ def _prepare_input(
             continue
 
         pts = pts_cam.astype(np.float32)
+        if R_fu is not None:
+            pts = (R_fu @ pts.T).T
 
         pts = pts - stone_center
 
         frame_idx = _extract_frame_index(path)
-        T = _turntable_rotation_y(frame_idx, angle_per_frame_deg)
+        T = _turntable_rotation_y(frame_idx, -angle_per_frame_deg)
         R = T[:3, :3].astype(np.float32)
         pts = (R @ pts.T).T
 

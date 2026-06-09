@@ -28,6 +28,12 @@ from torch.utils.data import Dataset
 
 from .prepare_gt import _turntable_rotation_y
 
+try:
+    from neural_pipeline.geometry import detect_floor_normal, floor_up_rotation
+    _HAS_FLOOR_UP = True
+except ImportError:
+    _HAS_FLOOR_UP = False
+
 
 # Each view entry: (frame_idx, npy_path, pose_4x4_or_None, mask_path_or_None)
 # pose=None means turntable rotation; pose=np.ndarray means explicit extrinsic.
@@ -85,6 +91,37 @@ def _load_poses_json(poses_path: str) -> Dict[int, np.ndarray]:
     for key, mat in data.items():
         poses[int(key)] = np.array(mat, dtype=np.float64)
     return poses
+
+
+def _load_gt_cloud(path: str) -> Optional[np.ndarray]:
+    """Load a GT point cloud (.ply or .npy). Returns (N, 3) or None."""
+    if not os.path.isfile(path):
+        return None
+    try:
+        if path.endswith(".npy"):
+            return np.load(path).astype(np.float32)
+        import open3d as o3d
+        pcd = o3d.io.read_point_cloud(path)
+        pts = np.asarray(pcd.points, dtype=np.float32)
+        return pts if pts.shape[0] > 0 else None
+    except Exception:
+        return None
+
+
+def _farthest_point_sample_np(pts: np.ndarray, n: int) -> np.ndarray:
+    """Numpy greedy FPS. Returns (n, 3)."""
+    if pts.shape[0] <= n:
+        if pts.shape[0] == 0:
+            return np.zeros((n, 3), dtype=np.float32)
+        choice = np.random.choice(pts.shape[0], n, replace=True)
+        return pts[choice]
+    selected = [np.random.randint(pts.shape[0])]
+    dists = np.full(pts.shape[0], np.inf)
+    for _ in range(n - 1):
+        d = np.sum((pts - pts[selected[-1]]) ** 2, axis=-1)
+        dists = np.minimum(dists, d)
+        selected.append(int(np.argmax(dists)))
+    return pts[np.array(selected)]
 
 
 def _random_rotation_matrix(max_angle_deg: float) -> np.ndarray:
@@ -165,6 +202,8 @@ class StoneReconDataset(Dataset):
         point_dropout_rate: float = 0.1,
         samples_per_epoch: int = 500,
         random_views_suffix: str = "_random_npy",
+        gt_cloud_dir: Optional[str] = None,
+        gt_cloud_points: int = 8192,
     ):
         super().__init__()
         self.dataset_dir = dataset_dir
@@ -181,6 +220,7 @@ class StoneReconDataset(Dataset):
         self.scale_jitter = scale_jitter
         self.point_dropout_rate = point_dropout_rate
         self.samples_per_epoch = samples_per_epoch
+        self.gt_cloud_points = gt_cloud_points
 
         self.volumes: Dict[str, float] = {}
         if volumes_json is not None:
@@ -197,6 +237,9 @@ class StoneReconDataset(Dataset):
         for sid in self.stone_ids:
             K = load_intrinsics(intrinsics_path, sid, width, height)
             self._intrinsics_cache[sid] = (K.fx, K.fy, K.cx, K.cy)
+
+        self._gt_cloud_paths: Dict[str, Optional[str]] = {}
+        self._floor_up_R: Dict[str, Optional[np.ndarray]] = {}
 
         self._view_entries: Dict[str, List[ViewEntry]] = {}
         for sid in self.stone_ids:
@@ -234,6 +277,32 @@ class StoneReconDataset(Dataset):
 
             self._view_entries[sid] = all_views
 
+            gt_path = None
+            if gt_cloud_dir:
+                for suffix in ("_gt_pointcloud.ply", "_gt_complete.ply", "_gt.ply"):
+                    candidate = os.path.join(gt_cloud_dir, f"{sid}{suffix}")
+                    if os.path.isfile(candidate):
+                        gt_path = candidate
+                        break
+            self._gt_cloud_paths[sid] = gt_path
+
+            R_fu = None
+            if _HAS_FLOOR_UP and os.path.isdir(turntable_dir):
+                fx, fy, cx, cy = self._intrinsics_cache[sid]
+                npy_files = sorted(
+                    f for f in os.listdir(turntable_dir) if f.endswith(".npy")
+                )
+                if npy_files:
+                    try:
+                        d0 = np.load(os.path.join(turntable_dir, npy_files[0])).astype(np.float32)
+                        pts0, _ = _backproject_np(d0, fx, fy, cx, cy)
+                        if pts0.shape[0] > 100:
+                            n_floor, _ = detect_floor_normal(pts0)
+                            R_fu = floor_up_rotation(n_floor).astype(np.float32)
+                    except Exception:
+                        pass
+            self._floor_up_R[sid] = R_fu
+
     def __len__(self) -> int:
         return self.samples_per_epoch
 
@@ -241,6 +310,7 @@ class StoneReconDataset(Dataset):
         stone_id = random.choice(self.stone_ids)
         view_entries = self._view_entries[stone_id]
         fx, fy, cx, cy = self._intrinsics_cache[stone_id]
+        R_fu = self._floor_up_R.get(stone_id)
 
         n_available = len(view_entries)
         K = random.randint(self.min_views, min(self.max_views, n_available))
@@ -273,9 +343,11 @@ class StoneReconDataset(Dataset):
                 t = pose_4x4[:3, 3].astype(np.float32)
                 pts_world = (R @ pts_cam.T).T + t
             else:
+                if R_fu is not None:
+                    pts_cam = (R_fu @ pts_cam.T).T
                 view_center = pts_cam.mean(axis=0)
                 pts_centered = pts_cam - view_center
-                T = _turntable_rotation_y(frame_idx, self.angle_per_frame_deg)
+                T = _turntable_rotation_y(frame_idx, -self.angle_per_frame_deg)
                 R = T[:3, :3].astype(np.float32)
                 pts_world = (R @ pts_centered.T).T
 
@@ -303,19 +375,29 @@ class StoneReconDataset(Dataset):
         seg_labels = np.concatenate(all_seg_labels, axis=0)
         view_ids = np.concatenate(all_view_ids, axis=0)
 
-        # Store pre-augmentation GT registered positions for flow target x_0.
-        # These are the clean turntable-aligned positions before any
-        # augmentation noise, and they share the same centroid subtraction.
-        centroid = points.mean(axis=0)
-        gt_points_registered = points - centroid
+        scene_centroid = points.mean(axis=0)
+
+        gt_cloud_path = self._gt_cloud_paths.get(stone_id)
+        if gt_cloud_path is not None:
+            gt_cloud = _load_gt_cloud(gt_cloud_path)
+            if gt_cloud is not None:
+                gt_cloud = _farthest_point_sample_np(gt_cloud, self.gt_cloud_points)
+                gt_centroid = gt_cloud.mean(axis=0)
+                gt_points_registered = gt_cloud - gt_centroid
+            else:
+                gt_points_registered = points - scene_centroid
+        else:
+            gt_points_registered = points - scene_centroid
 
         if self.augment:
             if self.rotation_perturb_deg > 0:
                 R_aug = _random_rotation_matrix(self.rotation_perturb_deg)
                 points = (R_aug @ points.T).T
+                gt_points_registered = (R_aug @ gt_points_registered.T).T
             if self.scale_jitter > 0:
                 scale = 1.0 + random.uniform(-self.scale_jitter, self.scale_jitter)
                 points = points * scale
+                gt_points_registered = gt_points_registered * scale
 
         points = points - points.mean(axis=0)
 

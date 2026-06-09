@@ -104,8 +104,14 @@ class StoneReconLoss(nn.Module):
     def _flow_velocity_loss(
         v_pred: torch.Tensor, v_target: torch.Tensor,
     ) -> torch.Tensor:
-        """MSE loss on predicted vs target velocity field (RPF-style)."""
-        return F.mse_loss(v_pred, v_target)
+        """MSE loss on predicted vs target velocity field (RPF-style).
+
+        Both predictions and targets are re-centered to remove any residual
+        offset between the predicted and GT coordinate frames.
+        """
+        v_pred_c = v_pred - v_pred.mean(dim=1, keepdim=True)
+        v_target_c = v_target - v_target.mean(dim=1, keepdim=True)
+        return F.mse_loss(v_pred_c, v_target_c)
 
     def _segmentation_loss(
         self,

@@ -1,0 +1,14 @@
+{
+  "stone_01": {
+    "stone_id": "stone_01",
+    "volume_mm3": 11698.66,
+    "volume_cm3": 11.698661,
+    "volume_voxel_mm3": 9765.12,
+    "volume_hull_mm3": 13632.2,
+    "n_points": 102328,
+    "n_views": 120,
+    "n_views_turntable": 120,
+    "n_views_random": 0,
+    "ply_path": "volume_estimation/gt_clouds_test/stone_01_gt_pointcloud.ply"
+  }
+}
