@@ -152,9 +152,11 @@ def _process_depth_dir(
             t = poses[frame_idx][:3, 3]
             pts_world = (R @ pts_stone.T).T + t
         else:
+            view_center = pts_stone.mean(axis=0)
+            pts_centered = pts_stone - view_center
             T = _turntable_rotation_y(frame_idx, angle_per_frame_deg)
             R = T[:3, :3]
-            pts_world = (R @ pts_stone.T).T
+            pts_world = (R @ pts_centered.T).T
 
         all_stone_pts.append(pts_world)
         n_views += 1

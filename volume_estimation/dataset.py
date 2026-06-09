@@ -273,9 +273,11 @@ class StoneReconDataset(Dataset):
                 t = pose_4x4[:3, 3].astype(np.float32)
                 pts_world = (R @ pts_cam.T).T + t
             else:
+                view_center = pts_cam.mean(axis=0)
+                pts_centered = pts_cam - view_center
                 T = _turntable_rotation_y(frame_idx, self.angle_per_frame_deg)
                 R = T[:3, :3].astype(np.float32)
-                pts_world = (R @ pts_cam.T).T
+                pts_world = (R @ pts_centered.T).T
 
             if self.augment and self.point_dropout_rate > 0:
                 keep = np.random.rand(pts_world.shape[0]) > self.point_dropout_rate

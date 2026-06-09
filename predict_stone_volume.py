@@ -118,6 +118,7 @@ def _prepare_input(
     all_view_ids = []
     view_counter = 0
 
+    view_centroids = []
     for path in depth_files:
         depth = np.load(path).astype(np.float32)
         if depth.shape != (intrinsics.height, intrinsics.width):
@@ -129,6 +130,25 @@ def _prepare_input(
             continue
 
         pts = pts_cam.astype(np.float32)
+        view_centroids.append(pts.mean(axis=0))
+
+    if view_centroids:
+        stone_center = np.mean(view_centroids, axis=0).astype(np.float32)
+    else:
+        stone_center = np.zeros(3, dtype=np.float32)
+
+    for path in depth_files:
+        depth = np.load(path).astype(np.float32)
+        if depth.shape != (intrinsics.height, intrinsics.width):
+            continue
+
+        pts_cam, _ = _backproject_full(depth, intrinsics, stride=1)
+        if pts_cam.shape[0] == 0:
+            continue
+
+        pts = pts_cam.astype(np.float32)
+
+        pts = pts - stone_center
 
         frame_idx = _extract_frame_index(path)
         T = _turntable_rotation_y(frame_idx, angle_per_frame_deg)
