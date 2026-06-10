@@ -236,14 +236,15 @@ def predict(
     """
     model.eval()
 
-    registered_pts, seg_logits = model.sample_rectified_flow(
+    flow_pts_raw, upsampled_pts, seg_logits = model.sample_rectified_flow(
         batch, num_steps=flow_steps,
     )
 
     seg_probs = torch.sigmoid(seg_logits[0]).cpu().numpy()
     stone_mask_full = seg_probs > 0.5
 
-    flow_pts = registered_pts[0].cpu().numpy()
+    flow_pts = flow_pts_raw[0].cpu().numpy()
+    upsampled = upsampled_pts[0].cpu().numpy()
 
     input_pts = batch["points"][0].cpu().numpy()
     stone_pts_input = input_pts[stone_mask_full] + centroid
@@ -254,24 +255,27 @@ def predict(
 
     results = {
         "flow_points": flow_pts,
+        "upsampled_points": upsampled,
         "stone_points_input": stone_pts_input,
         "seg_probs": seg_probs,
         "n_stone_points": n_stone,
         "n_total_points": n_total,
         "n_flow_points": flow_pts.shape[0],
+        "n_upsampled_points": upsampled.shape[0],
         "seg_ratio": seg_ratio,
         "flow_steps": flow_steps,
     }
 
-    mesh_pts = flow_pts
+    mesh_pts = upsampled
     if mesh_pts.shape[0] < 50:
-        LOG.warning("Too few flow points (%d) for mesh reconstruction", mesh_pts.shape[0])
+        LOG.warning("Too few upsampled points (%d) for mesh reconstruction", mesh_pts.shape[0])
         results["volume_cm3"] = 0.0
         results["volume_mm3"] = 0.0
         results["mesh"] = None
         return results
 
-    LOG.info("Building Poisson mesh from %d flow-generated points", mesh_pts.shape[0])
+    LOG.info("Building Poisson mesh from %d upsampled points (flow: %d -> upsampled: %d)",
+             mesh_pts.shape[0], flow_pts.shape[0], upsampled.shape[0])
 
     mesh, pcd = poisson_mesh(mesh_pts, depth=poisson_depth)
 
@@ -307,6 +311,13 @@ def save_results(
         o3d.io.write_point_cloud(ply_path, pcd)
         LOG.info("Saved flow cloud: %s (%d pts)", ply_path, flow_pts.shape[0])
 
+    upsampled = results.get("upsampled_points")
+    if upsampled is not None and upsampled.shape[0] > 0:
+        up_pcd = make_pcd(upsampled, estimate_normals=True)
+        up_path = os.path.join(output_dir, "stone_upsampled.ply")
+        o3d.io.write_point_cloud(up_path, up_pcd)
+        LOG.info("Saved upsampled cloud: %s (%d pts)", up_path, upsampled.shape[0])
+
     stone_pts = results["stone_points_input"]
     if stone_pts.shape[0] > 0:
         stone_pcd = make_pcd(stone_pts, estimate_normals=True)
@@ -334,6 +345,7 @@ def save_results(
         f"Total points:     {results['n_total_points']}",
         f"Stone points:     {results['n_stone_points']} ({results['seg_ratio']:.1%})",
         f"Flow points:      {results['n_flow_points']}",
+        f"Upsampled points: {results.get('n_upsampled_points', 'N/A')}",
         f"Flow ODE steps:   {results['flow_steps']}",
         "",
         "--- Mesh Reconstruction ---",
@@ -356,6 +368,7 @@ def save_results(
         f"Inference time:   {elapsed_s:.3f} s",
         "",
         "Output files:",
+        "  Upsampled PC:   stone_upsampled.ply",
         "  Flow PC:        stone_flow.ply",
         "  Segmented PC:   stone_segmented.ply",
     ]
@@ -380,6 +393,7 @@ def save_results(
         "n_stone_points": results["n_stone_points"],
         "n_total_points": results["n_total_points"],
         "n_flow_points": results["n_flow_points"],
+        "n_upsampled_points": results.get("n_upsampled_points", 0),
         "seg_ratio": results["seg_ratio"],
         "flow_steps": results["flow_steps"],
         "n_views": n_views,

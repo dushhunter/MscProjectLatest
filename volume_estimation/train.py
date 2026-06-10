@@ -253,6 +253,7 @@ def train(
     wandb_project: str = "stone-recon",
     loss_w_seg: float = 1.0,
     loss_w_flow: float = 1.0,
+    loss_w_chamfer: float = 0.5,
     patience: int = 30,
     width: int = 1024,
     height: int = 576,
@@ -297,7 +298,7 @@ def train(
     )
 
     model_cfg = StoneReconNetConfig()
-    loss_weights = LossWeights(seg=loss_w_seg, flow=loss_w_flow)
+    loss_weights = LossWeights(seg=loss_w_seg, flow=loss_w_flow, chamfer=loss_w_chamfer)
 
     lit_model = StoneReconLightning(
         model_cfg=model_cfg,
@@ -310,7 +311,8 @@ def train(
 
     param_counts = lit_model.model.count_parameters()
     LOG.info("Model parameters: %s", param_counts)
-    LOG.info("Loss weights -- seg: %.3f, flow: %.3f", loss_w_seg, loss_w_flow)
+    LOG.info("Loss weights -- seg: %.3f, flow: %.3f, chamfer: %.3f",
+             loss_w_seg, loss_w_flow, loss_w_chamfer)
     if freeze_encoder_after >= 0:
         LOG.info("Encoder freezes after epoch %d", freeze_encoder_after)
 
@@ -385,6 +387,7 @@ def train(
         "lr": lr,
         "loss_w_seg": loss_w_seg,
         "loss_w_flow": loss_w_flow,
+        "loss_w_chamfer": loss_w_chamfer,
         "freeze_encoder_after": freeze_encoder_after,
         "random_views_suffix": random_views_suffix,
     }
@@ -425,6 +428,8 @@ def main():
                         help="Weight for segmentation BCE loss")
     parser.add_argument("--loss_w_flow", type=float, default=1.0,
                         help="Weight for RPF flow velocity MSE loss")
+    parser.add_argument("--loss_w_chamfer", type=float, default=0.5,
+                        help="Weight for Chamfer distance loss (upsampled vs GT2)")
 
     parser.add_argument("--freeze_encoder_after", type=int, default=-1,
                         help="Freeze PointNet++ encoder after this epoch (-1 = never)")
@@ -461,6 +466,7 @@ def main():
         wandb_project=args.wandb_project,
         loss_w_seg=args.loss_w_seg,
         loss_w_flow=args.loss_w_flow,
+        loss_w_chamfer=args.loss_w_chamfer,
         patience=args.patience,
         width=args.width,
         height=args.height,

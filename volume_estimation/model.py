@@ -42,7 +42,7 @@ class StoneReconNetConfig:
     sa2_nsample: int = 32
     sa2_mlp: List[int] = field(default_factory=lambda: [128, 128, 256])
 
-    sa3_npoint: int = 128
+    sa3_npoint: int = 512
     sa3_radius: float = 0.04
     sa3_nsample: int = 32
     sa3_mlp: List[int] = field(default_factory=lambda: [256, 256, 256])
@@ -63,6 +63,9 @@ class StoneReconNetConfig:
     timestep_sampling: str = "u_shaped"
     inference_sampling_steps: int = 10
     t_embed_dim: int = 64
+
+    # Flow upsampler: expands flow output for denser Poisson meshing
+    upsample_factor: int = 4
 
 
 class SinusoidalTimestepEmbedding(nn.Module):
@@ -149,6 +152,45 @@ class FlowHead(nn.Module):
         return self.net(combined)
 
 
+class FlowUpsampler(nn.Module):
+    """Expand a sparse flow-generated point cloud to a denser one.
+
+    Each input seed point produces `factor` output points via learned offsets.
+    Input (B, M, 3) -> Output (B, M*factor, 3).
+    """
+
+    def __init__(self, embed_dim: int, factor: int = 4):
+        super().__init__()
+        self.factor = factor
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim + 3, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 3 * factor),
+        )
+
+    def forward(
+        self, points: torch.Tensor, features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            points: (B, M, 3) seed point positions from flow output.
+            features: (B, M, D) fused features for each seed point.
+
+        Returns:
+            (B, M*factor, 3) upsampled point cloud.
+        """
+        B, M, _ = points.shape
+        combined = torch.cat([features, points], dim=-1)
+        offsets = self.net(combined)
+        offsets = offsets.view(B, M, self.factor, 3)
+        seeds = points.unsqueeze(2).expand(-1, -1, self.factor, -1)
+        expanded = (seeds + offsets).reshape(B, M * self.factor, 3)
+        return expanded
+
+
 class StoneReconNet(nn.Module):
     """Neural multi-view stone reconstruction with RPF-style flow registration.
 
@@ -157,6 +199,7 @@ class StoneReconNet(nn.Module):
       2. Segmentation head classifies stone vs floor/background per point.
       3. Multi-view attention fuses features across views.
       4. Flow head predicts per-point velocity field (RPF rectified flow).
+      5. Flow upsampler expands sparse flow output to dense cloud.
 
     Training: segmentation BCE + flow velocity MSE.
     Inference: segment stone -> Euler ODE registration -> Poisson mesh -> volume.
@@ -202,6 +245,11 @@ class StoneReconNet(nn.Module):
         self.flow_head = FlowHead(
             embed_dim=cfg.attn_embed_dim,
             t_embed_dim=cfg.t_embed_dim,
+        )
+
+        self.flow_upsampler = FlowUpsampler(
+            embed_dim=cfg.attn_embed_dim,
+            factor=cfg.upsample_factor,
         )
 
         self.timestep_sampling = cfg.timestep_sampling
@@ -308,6 +356,10 @@ class StoneReconNet(nn.Module):
             output["x_1"] = x_1
             output["x_t"] = x_t
 
+            upsampled = self.flow_upsampler(x_0_sa, fused)
+            output["upsampled_points"] = upsampled
+            output["gt_cloud"] = gt_cloud
+
         return output
 
     def forward_inference(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -344,18 +396,12 @@ class StoneReconNet(nn.Module):
     def sample_rectified_flow(
         self, batch: Dict[str, torch.Tensor],
         num_steps: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Euler ODE integration for flow-based registration (from RPF).
-
-        Integrates from t=1 (noise) toward t=0 (registered) to produce
-        the registered point cloud at the SA level.
-
-        At each step the flow head sees the CURRENT position x_t and the
-        CURRENT timestep t, allowing position-dependent velocity prediction
-        that iteratively refines the point cloud toward registration.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Euler ODE integration followed by learned upsampling.
 
         Returns:
-            registered_points: (B, M, 3) registered point positions.
+            flow_points: (B, M, 3) raw flow output (SA-level, 512 pts).
+            upsampled_points: (B, M*factor, 3) dense cloud (2048 pts).
             seg_logits: (B, N) per-point segmentation logits.
         """
         if num_steps is None:
@@ -375,7 +421,9 @@ class StoneReconNet(nn.Module):
             v_pred = self.flow_head(fused, x_t, t_tensor)
             x_t = x_t - v_pred * dt
 
-        return x_t, inf_out["seg_logits"]
+        upsampled = self.flow_upsampler(x_t, fused)
+
+        return x_t, upsampled, inf_out["seg_logits"]
 
     # ------------------------------------------------------------------
     # Helpers

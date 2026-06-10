@@ -74,12 +74,20 @@ def _load_gt_cloud(path: str) -> Optional[np.ndarray]:
 
 
 def _farthest_point_sample_np(pts: np.ndarray, n: int) -> np.ndarray:
-    """Numpy greedy FPS. Returns (n, 3)."""
+    """Downsample to n points with good spatial coverage.
+
+    Uses random pre-sampling to cap the working set, then greedy FPS
+    on the smaller set. This avoids O(N*n) with huge N.
+    """
     if pts.shape[0] <= n:
         if pts.shape[0] == 0:
             return np.zeros((n, 3), dtype=np.float32)
         choice = np.random.choice(pts.shape[0], n, replace=True)
         return pts[choice]
+    cap = min(pts.shape[0], n * 4)
+    if pts.shape[0] > cap:
+        idx = np.random.choice(pts.shape[0], cap, replace=False)
+        pts = pts[idx]
     selected = [np.random.randint(pts.shape[0])]
     dists = np.full(pts.shape[0], np.inf)
     for _ in range(n - 1):
@@ -190,7 +198,7 @@ class StoneReconDataset(Dataset):
             K = load_intrinsics(intrinsics_path, sid, width, height)
             self._intrinsics_cache[sid] = (K.fx, K.fy, K.cx, K.cy)
 
-        self._gt_cloud_paths: Dict[str, Optional[str]] = {}
+        self._gt_clouds_cached: Dict[str, Optional[np.ndarray]] = {}
 
         self._view_entries: Dict[str, List[ViewEntry]] = {}
         for sid in self.stone_ids:
@@ -212,14 +220,39 @@ class StoneReconDataset(Dataset):
 
             self._view_entries[sid] = all_views
 
-            gt_path = None
+            gt_cached = None
             if gt_cloud_dir:
-                for suffix in ("_gt_pointcloud.ply", "_gt_complete.ply", "_gt.ply"):
-                    candidate = os.path.join(gt_cloud_dir, f"{sid}{suffix}")
-                    if os.path.isfile(candidate):
-                        gt_path = candidate
-                        break
-            self._gt_cloud_paths[sid] = gt_path
+                cache_npy = os.path.join(
+                    gt_cloud_dir, f"{sid}_cached_{gt_cloud_points}.npy",
+                )
+                if os.path.isfile(cache_npy):
+                    gt_cached = np.load(cache_npy).astype(np.float32)
+                    import logging
+                    logging.getLogger(__name__).info(
+                        "GT cloud %s: loaded from cache (%d pts)", sid, gt_cached.shape[0],
+                    )
+                else:
+                    for suffix in ("_gt_pointcloud.ply", "_gt_complete.ply", "_gt.ply"):
+                        candidate = os.path.join(gt_cloud_dir, f"{sid}{suffix}")
+                        if os.path.isfile(candidate):
+                            import logging
+                            logging.getLogger(__name__).info(
+                                "GT cloud %s: loading %s ...", sid, candidate,
+                            )
+                            raw = _load_gt_cloud(candidate)
+                            if raw is not None:
+                                logging.getLogger(__name__).info(
+                                    "GT cloud %s: FPS %d -> %d ...",
+                                    sid, raw.shape[0], gt_cloud_points,
+                                )
+                                gt_cached = _farthest_point_sample_np(raw, gt_cloud_points)
+                                gt_cached = (gt_cached - gt_cached.mean(axis=0)).astype(np.float32)
+                                np.save(cache_npy, gt_cached)
+                                logging.getLogger(__name__).info(
+                                    "GT cloud %s: cached to %s", sid, cache_npy,
+                                )
+                            break
+            self._gt_clouds_cached[sid] = gt_cached
 
     def __len__(self) -> int:
         return self.samples_per_epoch
@@ -281,13 +314,9 @@ class StoneReconDataset(Dataset):
 
         points = points - points.mean(axis=0)
 
-        gt_cloud_loaded = None
-        gt_cloud_path = self._gt_cloud_paths.get(stone_id)
-        if gt_cloud_path is not None:
-            raw = _load_gt_cloud(gt_cloud_path)
-            if raw is not None:
-                gt_cloud_loaded = _farthest_point_sample_np(raw, self.gt_cloud_points)
-                gt_cloud_loaded = gt_cloud_loaded - gt_cloud_loaded.mean(axis=0)
+        gt_cloud_loaded = self._gt_clouds_cached.get(stone_id)
+        if gt_cloud_loaded is not None:
+            gt_cloud_loaded = gt_cloud_loaded.copy()
 
         if self.augment:
             if self.scale_jitter > 0:

@@ -1,8 +1,9 @@
 """Loss functions for StoneReconNet training.
 
-Two loss terms following RPF's training pattern:
+Three loss terms:
   - BCE segmentation loss (stone vs floor/background)
-  - MSE flow velocity loss (RPF rectified flow registration)
+  - MSE flow velocity loss (RPF rectified flow)
+  - Chamfer distance loss (upsampled flow output vs GT2 cloud)
 """
 
 from __future__ import annotations
@@ -20,17 +21,34 @@ class LossWeights:
     """Relative weights for each loss term."""
     seg: float = 1.0
     flow: float = 1.0
+    chamfer: float = 0.5
+
+
+def _chamfer_distance(
+    pred: torch.Tensor, gt: torch.Tensor,
+) -> torch.Tensor:
+    """Symmetric Chamfer distance between two point clouds.
+
+    Args:
+        pred: (B, M, 3) predicted points.
+        gt: (B, K, 3) ground-truth points.
+
+    Returns:
+        Scalar mean Chamfer distance across the batch.
+    """
+    dists = torch.cdist(pred, gt)
+    min_pred_to_gt = dists.min(dim=2).values.mean(dim=1)
+    min_gt_to_pred = dists.min(dim=1).values.mean(dim=1)
+    return (min_pred_to_gt + min_gt_to_pred).mean()
 
 
 class StoneReconLoss(nn.Module):
-    """Segmentation + flow registration loss for StoneReconNet.
+    """Segmentation + flow + Chamfer loss for StoneReconNet.
 
     Components:
-      1. BCE loss for per-point stone vs floor/background segmentation.
+      1. BCE loss for per-point stone vs floor segmentation.
       2. MSE loss for flow velocity field (RPF rectified flow).
-
-    The flow velocity MSE follows RPF's loss() pattern: it supervises the
-    predicted velocity v_pred against the rectified flow target v_t = x_1 - x_0.
+      3. Chamfer distance between upsampled flow output and GT2 cloud.
     """
 
     def __init__(self, weights: Optional[LossWeights] = None):
@@ -42,14 +60,6 @@ class StoneReconLoss(nn.Module):
         output: Dict[str, torch.Tensor],
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            output: model output dict with seg_logits, and optionally v_pred, v_t.
-            batch: data dict with seg_labels, pad_mask, n_points.
-
-        Returns:
-            dict with 'loss' (total) and individual loss terms.
-        """
         losses = {}
 
         seg_loss = self._segmentation_loss(
@@ -64,6 +74,13 @@ class StoneReconLoss(nn.Module):
             flow_loss = self._flow_velocity_loss(output["v_pred"], output["v_t"])
             losses["flow_loss"] = flow_loss
             total = total + self.w.flow * flow_loss
+
+        if "upsampled_points" in output and "gt_cloud" in output:
+            chamfer_loss = _chamfer_distance(
+                output["upsampled_points"], output["gt_cloud"],
+            )
+            losses["chamfer_loss"] = chamfer_loss
+            total = total + self.w.chamfer * chamfer_loss
 
         losses["loss"] = total
 
@@ -83,7 +100,6 @@ class StoneReconLoss(nn.Module):
             tp = ((pred_valid == 1) & (gt_valid == 1)).sum().float()
             fp = ((pred_valid == 1) & (gt_valid == 0)).sum().float()
             fn = ((pred_valid == 0) & (gt_valid == 1)).sum().float()
-            tn = ((pred_valid == 0) & (gt_valid == 0)).sum().float()
 
             precision = tp / (tp + fp).clamp(min=1)
             recall = tp / (tp + fn).clamp(min=1)
@@ -104,11 +120,7 @@ class StoneReconLoss(nn.Module):
     def _flow_velocity_loss(
         v_pred: torch.Tensor, v_target: torch.Tensor,
     ) -> torch.Tensor:
-        """MSE loss on predicted vs target velocity field (RPF-style).
-
-        Both predictions and targets are re-centered to remove any residual
-        offset between the predicted and GT coordinate frames.
-        """
+        """MSE loss on predicted vs target velocity field (RPF-style)."""
         v_pred_c = v_pred - v_pred.mean(dim=1, keepdim=True)
         v_target_c = v_target - v_target.mean(dim=1, keepdim=True)
         return F.mse_loss(v_pred_c, v_target_c)
