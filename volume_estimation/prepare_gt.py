@@ -176,6 +176,7 @@ def _process_depth_dir(
 
     all_stone_pts: List[np.ndarray] = []
     n_views = 0
+    _returned_turntable_center = turntable_center
 
     for npy_file in npy_files:
         stem = Path(npy_file).stem
@@ -223,7 +224,7 @@ def _process_depth_dir(
         all_stone_pts.append(pts_world)
         n_views += 1
 
-    return all_stone_pts, n_views
+    return all_stone_pts, n_views, _returned_turntable_center
 
 
 def process_one_stone(
@@ -269,8 +270,8 @@ def process_one_stone(
     all_stone_pts: List[np.ndarray] = []
     n_views_turntable = 0
     n_views_random = 0
+    turntable_center = None
 
-    # Detect floor from first available depth frame to get floor-up rotation
     R_floor_up = None
     if os.path.isdir(depth_npy_dir):
         first_npy = sorted(f for f in os.listdir(depth_npy_dir) if f.endswith(".npy"))
@@ -287,7 +288,7 @@ def process_one_stone(
     if os.path.isdir(depth_npy_dir):
         turntable_poses_path = os.path.join(depth_npy_dir, "poses.json")
         tt_poses = _load_poses_json(turntable_poses_path) if os.path.isfile(turntable_poses_path) else None
-        pts_list, n = _process_depth_dir(
+        pts_list, n, turntable_center = _process_depth_dir(
             depth_npy_dir, mask_by_index, intrinsics, tt_poses, angle_per_frame_deg,
             R_floor_up=R_floor_up,
         )
@@ -300,7 +301,7 @@ def process_one_stone(
         random_poses_path = os.path.join(random_views_dir, "poses.json")
         if os.path.isfile(random_poses_path):
             rand_poses = _load_poses_json(random_poses_path)
-            pts_list, n = _process_depth_dir(
+            pts_list, n, _ = _process_depth_dir(
                 random_views_dir, mask_by_index, intrinsics, rand_poses, angle_per_frame_deg,
             )
             all_stone_pts.extend(pts_list)
@@ -325,6 +326,13 @@ def process_one_stone(
     final_pts = np.asarray(pcd.points)
     LOG.info("  After downsampling + outlier removal: %d points", final_pts.shape[0])
 
+    n_gt_final = 16384
+    final_pts_fps = _farthest_point_sample(final_pts, n_gt_final)
+    gt_centroid = final_pts_fps.mean(axis=0)
+    final_pts_centered = final_pts_fps - gt_centroid
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(final_pts_centered.astype(np.float64))
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(
             radius=6 * voxel_downsample_m, max_nn=40
@@ -335,6 +343,15 @@ def process_one_stone(
     ply_path = os.path.join(output_dir, f"{stone_id}_gt_pointcloud.ply")
     o3d.io.write_point_cloud(ply_path, pcd)
     LOG.info("  Saved: %s", ply_path)
+
+    reg_path = os.path.join(output_dir, f"{stone_id}_registration.npz")
+    reg_data = {"gt_centroid": gt_centroid.astype(np.float64)}
+    if R_floor_up is not None:
+        reg_data["R_floor_up"] = R_floor_up.astype(np.float64)
+    if turntable_center is not None:
+        reg_data["turntable_center"] = turntable_center.astype(np.float64)
+    np.savez(reg_path, **reg_data)
+    LOG.info("  Saved registration params: %s", reg_path)
 
     vol_voxel = _compute_volume_voxel(final_pts, voxel_size_mm=voxel_volume_mm)
     vol_hull = _compute_volume_convex_hull(final_pts)

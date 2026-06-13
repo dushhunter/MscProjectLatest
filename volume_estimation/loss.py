@@ -61,14 +61,16 @@ class StoneReconLoss(nn.Module):
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
         losses = {}
+        device = batch["points"].device
+        total = torch.tensor(0.0, device=device, requires_grad=True)
 
-        seg_loss = self._segmentation_loss(
-            output["seg_logits"], batch["seg_labels"],
-            batch["pad_mask"], batch["n_points"],
-        )
-        losses["seg_loss"] = seg_loss
-
-        total = self.w.seg * seg_loss
+        if "seg_logits" in output and self.w.seg > 0:
+            seg_loss = self._segmentation_loss(
+                output["seg_logits"], batch["seg_labels"],
+                batch["pad_mask"], batch["n_points"],
+            )
+            losses["seg_loss"] = seg_loss
+            total = total + self.w.seg * seg_loss
 
         if "v_pred" in output and "v_t" in output:
             flow_loss = self._flow_velocity_loss(output["v_pred"], output["v_t"])
@@ -84,46 +86,20 @@ class StoneReconLoss(nn.Module):
 
         losses["loss"] = total
 
-        with torch.no_grad():
-            seg_probs = torch.sigmoid(output["seg_logits"])
-            valid = ~batch["pad_mask"]
-            pred_seg = (seg_probs > 0.5).float()
-            gt_seg = batch["seg_labels"]
-
-            pred_valid = pred_seg[valid]
-            gt_valid = gt_seg[valid]
-            n_valid = valid.sum().clamp(min=1)
-
-            correct = (pred_valid == gt_valid).sum()
-            losses["seg_acc"] = (correct.float() / n_valid.float()).detach()
-
-            tp = ((pred_valid == 1) & (gt_valid == 1)).sum().float()
-            fp = ((pred_valid == 1) & (gt_valid == 0)).sum().float()
-            fn = ((pred_valid == 0) & (gt_valid == 1)).sum().float()
-
-            precision = tp / (tp + fp).clamp(min=1)
-            recall = tp / (tp + fn).clamp(min=1)
-            f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-6)
-            iou = tp / (tp + fp + fn).clamp(min=1)
-
-            losses["seg_precision"] = precision.detach()
-            losses["seg_recall"] = recall.detach()
-            losses["seg_f1"] = f1.detach()
-            losses["seg_iou"] = iou.detach()
-
-            stone_ratio = gt_valid.sum().float() / n_valid.float()
-            losses["seg_stone_ratio"] = stone_ratio.detach()
-
         return losses
 
     @staticmethod
     def _flow_velocity_loss(
         v_pred: torch.Tensor, v_target: torch.Tensor,
     ) -> torch.Tensor:
-        """MSE loss on predicted vs target velocity field (RPF-style)."""
-        v_pred_c = v_pred - v_pred.mean(dim=1, keepdim=True)
-        v_target_c = v_target - v_target.mean(dim=1, keepdim=True)
-        return F.mse_loss(v_pred_c, v_target_c)
+        """MSE loss on predicted vs target velocity field (RAP Eq.6).
+
+        Raw MSE without center-subtraction: the model must learn the full
+        velocity including the mean translation component.  Our inputs and
+        GT are already zero-centered, so the mean velocity is near zero and
+        the gradient signal is well-conditioned.
+        """
+        return F.mse_loss(v_pred, v_target)
 
     def _segmentation_loss(
         self,

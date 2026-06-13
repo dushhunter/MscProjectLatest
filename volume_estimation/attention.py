@@ -1,8 +1,14 @@
-"""RAP-inspired multi-view attention for point cloud fusion.
+"""RAP-inspired multi-view attention with AdaLN timestep conditioning.
 
 Implements part-wise (within-view) and global (cross-view) attention,
-with sinusoidal 3D position encoding and learnable view embeddings,
-following the DiTLayer design from RAP's PointCloudDiT.
+with sinusoidal 3D position encoding, learnable view embeddings, and
+Adaptive Layer Norm (AdaLN) that conditions every attention layer on
+the flow timestep -- following RAP's PointCloudDiT architecture.
+
+RAP conditions on both t (timestep) AND x_t (evolving flow positions):
+  - AdaLN modulates every layer by t (how far along the ODE)
+  - PE(x_t) encodes the current point positions at each ODE step,
+    so cross-view attention adapts to the evolving geometry.
 """
 
 from __future__ import annotations
@@ -16,11 +22,7 @@ import torch.nn.functional as F
 
 
 class SinusoidalPositionEncoding3D(nn.Module):
-    """Sinusoidal encoding of 3D coordinates, as used in RAP.
-
-    Maps each (x, y, z) coordinate to a higher-dimensional feature
-    using sinusoidal functions at multiple frequencies.
-    """
+    """Sinusoidal encoding of 3D coordinates, as used in RAP."""
 
     def __init__(self, embed_dim: int, max_freq_log2: float = 6.0, n_freq: int = 0):
         super().__init__()
@@ -35,13 +37,6 @@ class SinusoidalPositionEncoding3D(nn.Module):
         self.proj = nn.Linear(self.out_dim, embed_dim)
 
     def forward(self, xyz: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            xyz: (..., 3) coordinates.
-
-        Returns:
-            (..., embed_dim) position encodings.
-        """
         shape = xyz.shape[:-1]
         xyz_flat = xyz.reshape(-1, 3)
 
@@ -54,12 +49,38 @@ class SinusoidalPositionEncoding3D(nn.Module):
         return out.reshape(*shape, -1)
 
 
-class PartWiseAttention(nn.Module):
-    """Self-attention within each view's points (part-wise, from RAP DiTLayer).
+class AdaLN(nn.Module):
+    """Adaptive Layer Norm conditioned on timestep embedding (from RAP/DiT).
 
-    Points from the same view attend only to each other, respecting
-    the multi-view structure. Uses multi-head attention with QK-norm.
+    Instead of fixed LN, produces per-layer scale and shift from the timestep:
+        x = LN(x) * (1 + scale) + shift
+    where (scale, shift) = MLP(t_embed).
     """
+
+    def __init__(self, embed_dim: int, cond_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, 2 * embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor, t_embed: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, N, D) features.
+            t_embed: (B, D_cond) timestep embedding.
+
+        Returns:
+            (B, N, D) adaptively normalized features.
+        """
+        scale_shift = self.proj(t_embed).unsqueeze(1)
+        scale, shift = scale_shift.chunk(2, dim=-1)
+        return self.norm(x) * (1.0 + scale) + shift
+
+
+class PartWiseAttention(nn.Module):
+    """Self-attention within each view's points with AdaLN conditioning."""
 
     def __init__(self, embed_dim: int, n_heads: int = 8, qk_norm: bool = True):
         super().__init__()
@@ -76,22 +97,17 @@ class PartWiseAttention(nn.Module):
             self.q_norm = nn.LayerNorm(self.head_dim)
             self.k_norm = nn.LayerNorm(self.head_dim)
 
-        self.norm = nn.LayerNorm(embed_dim)
+        self.adaln = AdaLN(embed_dim, embed_dim)
 
     def forward(
-        self, x: torch.Tensor, view_ids: torch.Tensor, pad_mask: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        view_ids: torch.Tensor,
+        pad_mask: torch.Tensor,
+        t_embed: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            x: (B, N, D) point features.
-            view_ids: (B, N) integer view assignment for each point.
-            pad_mask: (B, N) True for padded positions.
-
-        Returns:
-            (B, N, D) attended features.
-        """
         residual = x
-        x = self.norm(x)
+        x = self.adaln(x, t_embed)
 
         B, N, D = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.n_heads, self.head_dim)
@@ -120,11 +136,7 @@ class PartWiseAttention(nn.Module):
 
 
 class GlobalCrossAttention(nn.Module):
-    """Global attention across all views (cross-view, from RAP DiTLayer).
-
-    All points attend to all other points regardless of view assignment,
-    enabling cross-view information exchange for implicit registration.
-    """
+    """Global attention across all views with AdaLN conditioning."""
 
     def __init__(self, embed_dim: int, n_heads: int = 8, qk_norm: bool = True):
         super().__init__()
@@ -140,21 +152,16 @@ class GlobalCrossAttention(nn.Module):
             self.q_norm = nn.LayerNorm(self.head_dim)
             self.k_norm = nn.LayerNorm(self.head_dim)
 
-        self.norm = nn.LayerNorm(embed_dim)
+        self.adaln = AdaLN(embed_dim, embed_dim)
 
     def forward(
-        self, x: torch.Tensor, pad_mask: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        pad_mask: torch.Tensor,
+        t_embed: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Args:
-            x: (B, N, D) point features.
-            pad_mask: (B, N) True for padded positions.
-
-        Returns:
-            (B, N, D) attended features.
-        """
         residual = x
-        x = self.norm(x)
+        x = self.adaln(x, t_embed)
 
         B, N, D = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.n_heads, self.head_dim)
@@ -182,20 +189,20 @@ class GlobalCrossAttention(nn.Module):
 
 
 class GEGLUFFN(nn.Module):
-    """Gated GELU feed-forward network (from RAP DiTLayer / diffusers)."""
+    """Gated GELU feed-forward network with AdaLN conditioning."""
 
     def __init__(self, embed_dim: int, hidden_dim: int = 0, dropout: float = 0.0):
         super().__init__()
         if hidden_dim == 0:
             hidden_dim = 4 * embed_dim
-        self.norm = nn.LayerNorm(embed_dim)
+        self.adaln = AdaLN(embed_dim, embed_dim)
         self.fc1 = nn.Linear(embed_dim, hidden_dim * 2)
         self.fc2 = nn.Linear(hidden_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t_embed: torch.Tensor) -> torch.Tensor:
         residual = x
-        x = self.norm(x)
+        x = self.adaln(x, t_embed)
         gate, value = self.fc1(x).chunk(2, dim=-1)
         x = F.gelu(gate) * value
         x = self.dropout(x)
@@ -204,7 +211,7 @@ class GEGLUFFN(nn.Module):
 
 
 class MultiViewAttentionBlock(nn.Module):
-    """One attention block combining part-wise + global + FFN (RAP DiTLayer pattern)."""
+    """One RAP DiTLayer block: part-wise attn + global attn + FFN, all with AdaLN."""
 
     def __init__(
         self,
@@ -220,19 +227,52 @@ class MultiViewAttentionBlock(nn.Module):
         self.ffn = GEGLUFFN(embed_dim, ffn_hidden_dim, dropout)
 
     def forward(
-        self, x: torch.Tensor, view_ids: torch.Tensor, pad_mask: torch.Tensor,
+        self,
+        x: torch.Tensor,
+        view_ids: torch.Tensor,
+        pad_mask: torch.Tensor,
+        t_embed: torch.Tensor,
     ) -> torch.Tensor:
-        x = self.part_attn(x, view_ids, pad_mask)
-        x = self.global_attn(x, pad_mask)
-        x = self.ffn(x)
+        x = self.part_attn(x, view_ids, pad_mask, t_embed)
+        x = self.global_attn(x, pad_mask, t_embed)
+        x = self.ffn(x, t_embed)
         return x
 
 
-class MultiViewAttention(nn.Module):
-    """Full multi-view attention stack (multiple DiTLayer-style blocks).
+class TimestepEmbedding(nn.Module):
+    """Sinusoidal timestep -> dense embedding for AdaLN conditioning."""
 
-    Combines sinusoidal 3D position encoding + learnable view embeddings
-    with a stack of part-wise/global attention blocks.
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.dim = embed_dim
+        half = embed_dim // 2
+        self.mlp = nn.Sequential(
+            nn.Linear(half * 2, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(half).float() / half
+        )
+        self.register_buffer("freqs", freqs)
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """t: (B,) scalar timesteps -> (B, embed_dim)."""
+        args = t.unsqueeze(-1) * self.freqs.unsqueeze(0)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+        return self.mlp(emb)
+
+
+class MultiViewAttention(nn.Module):
+    """Full multi-view attention stack with AdaLN flow conditioning.
+
+    Token input follows RAP's PointCloudDiT formulation:
+      token = proj(features) + PE(encoder_xyz) + PE(flow_xyz) + view_embed
+
+    PE(encoder_xyz) encodes the static SA3 positions (local geometry).
+    PE(flow_xyz) encodes the evolving x_t positions at each ODE step,
+    so cross-view attention adapts to the current point configuration.
+    AdaLN(t) conditions every layer on the scalar timestep.
     """
 
     def __init__(
@@ -249,7 +289,9 @@ class MultiViewAttention(nn.Module):
 
         self.input_proj = nn.Linear(input_dim, embed_dim) if input_dim != embed_dim else nn.Identity()
         self.pos_enc = SinusoidalPositionEncoding3D(embed_dim)
+        self.flow_pos_enc = SinusoidalPositionEncoding3D(embed_dim)
         self.view_embed = nn.Embedding(max_views, embed_dim)
+        self.t_embed_mod = TimestepEmbedding(embed_dim)
 
         self.blocks = nn.ModuleList([
             MultiViewAttentionBlock(embed_dim, n_heads, 0, qk_norm, dropout)
@@ -262,30 +304,44 @@ class MultiViewAttention(nn.Module):
     def forward(
         self,
         features: torch.Tensor,
-        xyz: torch.Tensor,
+        encoder_xyz: torch.Tensor,
         view_ids: torch.Tensor,
         pad_mask: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        flow_xyz: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             features: (B, N, C_in) point features from encoder.
-            xyz: (B, N, 3) point positions.
+            encoder_xyz: (B, N, 3) static SA3-level point positions.
             view_ids: (B, N) view assignment per point.
             pad_mask: (B, N) True for padded positions.
+            t: (B,) flow timestep in [0, 1]. None defaults to t=0.
+            flow_xyz: (B, N, 3) current flow positions x_t (RAP-style).
+                      When provided, PE(flow_xyz) is added to tokens so
+                      attention adapts to the evolving point geometry.
 
         Returns:
             (B, N, embed_dim) fused multi-view features.
         """
+        B = features.shape[0]
+        if t is None:
+            t = torch.zeros(B, device=features.device)
+
+        t_embed = self.t_embed_mod(t)
+
         x = self.input_proj(features)
 
-        pos = self.pos_enc(xyz)
-        x = x + pos
+        x = x + self.pos_enc(encoder_xyz)
+
+        if flow_xyz is not None:
+            x = x + self.flow_pos_enc(flow_xyz)
 
         view_emb = self.view_embed(view_ids.clamp(0, self.view_embed.num_embeddings - 1))
         x = x + view_emb
 
         for block in self.blocks:
-            x = block(x, view_ids, pad_mask)
+            x = block(x, view_ids, pad_mask, t_embed)
 
         x = self.final_norm(x)
         return x

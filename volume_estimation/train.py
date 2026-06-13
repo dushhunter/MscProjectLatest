@@ -84,7 +84,7 @@ class StoneReconLightning(pl.LightningModule):
         model_cfg: StoneReconNetConfig,
         loss_weights: LossWeights,
         lr: float = 1e-3,
-        weight_decay: float = 1e-4,
+        weight_decay: float = 1e-3,
         max_epochs: int = 200,
         freeze_encoder_after: int = -1,
     ):
@@ -116,7 +116,7 @@ class StoneReconLightning(pl.LightningModule):
         losses = self.loss(output, batch)
 
         B = batch["points"].shape[0]
-        prog_keys = {"loss", "seg_iou", "seg_f1"}
+        prog_keys = {"loss", "flow_loss", "chamfer_loss"}
         for k, v in losses.items():
             self.log(f"train/{k}", v, prog_bar=(k in prog_keys), batch_size=B)
 
@@ -127,7 +127,7 @@ class StoneReconLightning(pl.LightningModule):
         losses = self.loss(output, batch)
 
         B = batch["points"].shape[0]
-        prog_keys = {"loss", "seg_iou", "seg_f1"}
+        prog_keys = {"loss", "flow_loss", "chamfer_loss"}
         for k, v in losses.items():
             self.log(f"val/{k}", v, prog_bar=(k in prog_keys),
                      batch_size=B, sync_dist=True)
@@ -149,6 +149,16 @@ class StoneReconLightning(pl.LightningModule):
             and self.current_epoch >= self.freeze_encoder_after
         ):
             self.model.freeze_encoder()
+
+    def on_train_epoch_end(self) -> None:
+        metrics = {k: v.item() if hasattr(v, "item") else v
+                   for k, v in self.trainer.callback_metrics.items()}
+        parts = [f"Epoch {self.current_epoch:>4d}"]
+        for key in ["train/loss", "train/flow_loss", "train/chamfer_loss",
+                     "val/loss", "val/flow_loss", "val/chamfer_loss"]:
+            if key in metrics:
+                parts.append(f"{key}={metrics[key]:.4f}")
+        LOG.info("  ".join(parts))
 
     # ------------------------------------------------------------------
     # Optimizer
@@ -231,6 +241,12 @@ def get_stone_split(
             val_stones = all_stones[-2:] if len(all_stones) > 2 else all_stones[-1:]
 
     train_stones = [s for s in all_stones if s not in val_stones]
+
+    if not train_stones:
+        LOG.warning("Train set empty after split — using all stones for both "
+                    "train and val (single-stone overfitting mode)")
+        train_stones = list(all_stones)
+
     return train_stones, val_stones
 
 
@@ -243,7 +259,7 @@ def train(
     max_epochs: int = 200,
     batch_size: int = 4,
     lr: float = 1e-3,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 1e-3,
     max_points_per_view: int = 4096,
     train_samples_per_epoch: int = 500,
     val_samples_per_epoch: int = 100,
@@ -251,7 +267,7 @@ def train(
     precision: str = "16-mixed",
     use_wandb: bool = False,
     wandb_project: str = "stone-recon",
-    loss_w_seg: float = 1.0,
+    loss_w_seg: float = 0.0,
     loss_w_flow: float = 1.0,
     loss_w_chamfer: float = 0.5,
     patience: int = 30,
@@ -263,7 +279,22 @@ def train(
 ):
     """Run the full training pipeline."""
     os.makedirs(output_dir, exist_ok=True)
-    logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
+
+    log_file = os.path.join(output_dir, "training.log")
+    file_handler = logging.FileHandler(log_file, mode="w")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s | %(name)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(name)s | %(message)s"))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    LOG.info("Logging to console and %s", log_file)
 
     _enable_cuda_optimizations()
 
@@ -378,11 +409,21 @@ def train(
         torch.save(best.model.state_dict(), final_path)
         LOG.info("Saved final model weights: %s", final_path)
 
+    final_metrics = {k: v.item() if hasattr(v, "item") else v
+                     for k, v in trainer.callback_metrics.items()}
+    LOG.info("=" * 60)
+    LOG.info("TRAINING COMPLETE")
+    LOG.info("Best checkpoint: %s", best_ckpt)
+    for k in sorted(final_metrics):
+        LOG.info("  %-30s = %.6f", k, final_metrics[k])
+    LOG.info("=" * 60)
+
     summary = {
         "train_stones": train_stones,
         "val_stones": val_stones_final,
         "best_checkpoint": best_ckpt,
         "model_params": param_counts,
+        "final_metrics": {k: float(v) for k, v in final_metrics.items()},
         "max_epochs": max_epochs,
         "lr": lr,
         "loss_w_seg": loss_w_seg,
@@ -413,7 +454,7 @@ def main():
     parser.add_argument("--max_epochs", type=int, default=200)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--max_points_per_view", type=int, default=4096)
     parser.add_argument("--train_samples_per_epoch", type=int, default=500)
     parser.add_argument("--val_samples_per_epoch", type=int, default=100)
@@ -424,8 +465,8 @@ def main():
     parser.add_argument("--width", type=int, default=1024)
     parser.add_argument("--height", type=int, default=576)
 
-    parser.add_argument("--loss_w_seg", type=float, default=1.0,
-                        help="Weight for segmentation BCE loss")
+    parser.add_argument("--loss_w_seg", type=float, default=0.0,
+                        help="Weight for segmentation BCE loss (0 = disabled)")
     parser.add_argument("--loss_w_flow", type=float, default=1.0,
                         help="Weight for RPF flow velocity MSE loss")
     parser.add_argument("--loss_w_chamfer", type=float, default=0.5,
@@ -437,10 +478,9 @@ def main():
                         help="Suffix for random-views directories (default: _random_npy). "
                              "Set to empty string to disable random views.")
     parser.add_argument("--gt_cloud_dir", default=None,
-                        help="Directory with Blender-exported GT stone point clouds "
-                             "(stone_XX_gt_pointcloud.ply). When provided, the model "
-                             "learns to reconstruct the complete Blender stone shape "
-                             "instead of using turntable-merged depth as GT.")
+                        help="Directory with GT registered stone point clouds and "
+                             "registration params (from prepare_gt.py depth-merge "
+                             "mode). Required for the registered pipeline.")
 
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", default="stone-recon")

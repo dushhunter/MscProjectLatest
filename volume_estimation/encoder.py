@@ -242,15 +242,17 @@ class SegmentationHead(nn.Module):
     to the original point resolution using nearest-neighbor interpolation.
     """
 
-    def __init__(self, feature_dim: int = 256, hidden_dim: int = 128):
+    def __init__(self, feature_dim: int = 256, hidden_dim: int = 128, dropout: float = 0.3):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.BatchNorm1d(hidden_dim // 2),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, 1),
         )
 

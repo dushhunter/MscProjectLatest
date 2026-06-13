@@ -1,17 +1,22 @@
-"""PyTorch dataset for multi-view stone segmentation and reconstruction.
+"""PyTorch dataset for stone shape completion via registered point clouds.
 
-Sequential 3-stage pipeline:
-  Stage 1 -- Segmentation: identify stone vs floor per point (GT1 = masks).
-  Stage 2 -- Alignment: model learns cross-view correspondence from
-             camera-space inputs (no analytical poses applied).
-  Stage 3 -- Completion: flow head generates complete stone (GT2 = Blender PLY).
+Pipeline (alignment decoupled from learning):
+  1. Back-project each depth map to 3D (camera space).
+  2. Segment stone pixels using GT masks.
+  3. Register each view to a common frame using known turntable rotation
+     (params saved by prepare_gt.py).
+  4. Merge all registered stone views into a single partial cloud.
+  5. Center using the GT centroid.
 
-Points are fed in raw camera space so the model must learn alignment itself.
+The neural model receives the registered, stone-only partial cloud and
+learns only shape completion via flow matching -- the task RAP/RPF solve.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
 import random
 from pathlib import Path
@@ -21,10 +26,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+_LOG = logging.getLogger(__name__)
 
-# Each view entry: (frame_idx, npy_path, pose_4x4_or_None, mask_path_or_None)
-# pose=None means turntable rotation; pose=np.ndarray means explicit extrinsic.
-# mask=None means label all points as stone (no mask available).
 ViewEntry = Tuple[int, str, Optional[np.ndarray], Optional[str]]
 
 
@@ -57,7 +60,6 @@ def _load_mask_np(path: str, H: int, W: int) -> np.ndarray:
     return (arr > 127).ravel()
 
 
-
 def _load_gt_cloud(path: str) -> Optional[np.ndarray]:
     """Load a GT point cloud (.ply or .npy). Returns (N, 3) or None."""
     if not os.path.isfile(path):
@@ -74,11 +76,7 @@ def _load_gt_cloud(path: str) -> Optional[np.ndarray]:
 
 
 def _farthest_point_sample_np(pts: np.ndarray, n: int) -> np.ndarray:
-    """Downsample to n points with good spatial coverage.
-
-    Uses random pre-sampling to cap the working set, then greedy FPS
-    on the smaller set. This avoids O(N*n) with huge N.
-    """
+    """Downsample to *n* points with good spatial coverage via greedy FPS."""
     if pts.shape[0] <= n:
         if pts.shape[0] == 0:
             return np.zeros((n, 3), dtype=np.float32)
@@ -97,18 +95,44 @@ def _farthest_point_sample_np(pts: np.ndarray, n: int) -> np.ndarray:
     return pts[np.array(selected)]
 
 
+def _rotation_y(angle_rad: float) -> np.ndarray:
+    """3x3 rotation matrix around the Y (up/gravity) axis."""
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float32)
+
+
+def _register_view(
+    pts_cam: np.ndarray,
+    frame_idx: int,
+    R_floor_up: Optional[np.ndarray],
+    turntable_center: Optional[np.ndarray],
+    angle_per_frame_deg: float,
+) -> np.ndarray:
+    """Register camera-space points to the common turntable frame.
+
+    Replicates the exact registration from prepare_gt.py:
+      1. Apply floor-up rotation to align gravity with +Y.
+      2. Subtract optimised turntable center.
+      3. Apply inverse turntable Y-rotation for this frame index.
+    """
+    pts = pts_cam.astype(np.float64)
+    if R_floor_up is not None:
+        pts = (R_floor_up @ pts.T).T
+    if turntable_center is not None:
+        pts = pts - turntable_center
+    theta = math.radians(frame_idx * (-angle_per_frame_deg))
+    c, s = math.cos(theta), math.sin(theta)
+    R_yaw = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+    pts = (R_yaw @ pts.T).T
+    return pts.astype(np.float32)
+
 
 def _scan_depth_dir(
     depth_dir: str,
     external_poses: Optional[Dict[int, np.ndarray]] = None,
     mask_dir: Optional[str] = None,
 ) -> List[ViewEntry]:
-    """Scan a depth directory and return ViewEntry tuples.
-
-    If *external_poses* is provided, each view gets its explicit 4x4 matrix.
-    Otherwise pose is set to None (caller should use turntable formula).
-    If *mask_dir* is provided, masks are matched to views by frame index.
-    """
+    """Scan a depth directory and return ViewEntry tuples."""
     mask_by_idx: Dict[int, str] = {}
     if mask_dir and os.path.isdir(mask_dir):
         for f in sorted(os.listdir(mask_dir)):
@@ -132,15 +156,16 @@ def _scan_depth_dir(
 
 
 class StoneReconDataset(Dataset):
-    """Dataset that yields random multi-view samples for stone reconstruction.
+    """Dataset for stone shape completion with pre-registered point clouds.
 
-    Each __getitem__ call picks a stone at random, selects K random views,
-    back-projects them to 3D, applies GT masks and the appropriate transform
-    (turntable rotation OR explicit pose), and returns points with
-    segmentation labels and registered positions.
+    Each __getitem__ call:
+      1. Picks a random stone and K random views.
+      2. Back-projects each view, masks stone pixels, registers to common frame.
+      3. Merges views into a single partial stone cloud (FPS to fixed size).
+      4. Pairs with the depth-merge GT cloud (same coordinate frame).
 
-    Supports combined turntable + random views per stone.
-    GT volume is optionally included for validation metrics.
+    Registration uses analytical turntable poses; parameters are loaded from
+    ``{gt_cloud_dir}/{stone_id}_registration.npz`` (generated by prepare_gt.py).
     """
 
     def __init__(
@@ -154,12 +179,13 @@ class StoneReconDataset(Dataset):
         min_views: int = 4,
         max_views: int = 24,
         max_points_per_view: int = 4096,
+        merged_cloud_points: int = 8192,
         angle_per_frame_deg: float = 3.0,
         augment: bool = True,
         depth_noise_sigma_m: float = 0.002,
-        rotation_perturb_deg: float = 5.0,
         scale_jitter: float = 0.05,
         point_dropout_rate: float = 0.1,
+        xyz_jitter_sigma: float = 0.001,
         samples_per_epoch: int = 500,
         random_views_suffix: str = "_random_npy",
         gt_cloud_dir: Optional[str] = None,
@@ -173,12 +199,13 @@ class StoneReconDataset(Dataset):
         self.min_views = min_views
         self.max_views = max_views
         self.max_points_per_view = max_points_per_view
+        self.merged_cloud_points = merged_cloud_points
         self.angle_per_frame_deg = angle_per_frame_deg
         self.augment = augment
         self.depth_noise_sigma = depth_noise_sigma_m
-        self.rotation_perturb_deg = rotation_perturb_deg
         self.scale_jitter = scale_jitter
         self.point_dropout_rate = point_dropout_rate
+        self.xyz_jitter_sigma = xyz_jitter_sigma
         self.samples_per_epoch = samples_per_epoch
         self.gt_cloud_points = gt_cloud_points
 
@@ -198,6 +225,7 @@ class StoneReconDataset(Dataset):
             K = load_intrinsics(intrinsics_path, sid, width, height)
             self._intrinsics_cache[sid] = (K.fx, K.fy, K.cx, K.cy)
 
+        self._registration_params: Dict[str, Dict[str, np.ndarray]] = {}
         self._gt_clouds_cached: Dict[str, Optional[np.ndarray]] = {}
 
         self._view_entries: Dict[str, List[ViewEntry]] = {}
@@ -220,6 +248,18 @@ class StoneReconDataset(Dataset):
 
             self._view_entries[sid] = all_views
 
+            if gt_cloud_dir:
+                reg_path = os.path.join(gt_cloud_dir, f"{sid}_registration.npz")
+                if os.path.isfile(reg_path):
+                    data = dict(np.load(reg_path))
+                    self._registration_params[sid] = data
+                    _LOG.info("Registration params %s: loaded", sid)
+                else:
+                    _LOG.warning(
+                        "No registration params for %s at %s — "
+                        "run prepare_gt.py first", sid, reg_path,
+                    )
+
             gt_cached = None
             if gt_cloud_dir:
                 cache_npy = os.path.join(
@@ -227,30 +267,23 @@ class StoneReconDataset(Dataset):
                 )
                 if os.path.isfile(cache_npy):
                     gt_cached = np.load(cache_npy).astype(np.float32)
-                    import logging
-                    logging.getLogger(__name__).info(
-                        "GT cloud %s: loaded from cache (%d pts)", sid, gt_cached.shape[0],
-                    )
+                    _LOG.info("GT cloud %s: loaded from cache (%d pts)",
+                              sid, gt_cached.shape[0])
                 else:
                     for suffix in ("_gt_pointcloud.ply", "_gt_complete.ply", "_gt.ply"):
                         candidate = os.path.join(gt_cloud_dir, f"{sid}{suffix}")
                         if os.path.isfile(candidate):
-                            import logging
-                            logging.getLogger(__name__).info(
-                                "GT cloud %s: loading %s ...", sid, candidate,
-                            )
+                            _LOG.info("GT cloud %s: loading %s ...", sid, candidate)
                             raw = _load_gt_cloud(candidate)
                             if raw is not None:
-                                logging.getLogger(__name__).info(
-                                    "GT cloud %s: FPS %d -> %d ...",
-                                    sid, raw.shape[0], gt_cloud_points,
-                                )
+                                _LOG.info("GT cloud %s: FPS %d -> %d ...",
+                                          sid, raw.shape[0], gt_cloud_points)
                                 gt_cached = _farthest_point_sample_np(raw, gt_cloud_points)
-                                gt_cached = (gt_cached - gt_cached.mean(axis=0)).astype(np.float32)
-                                np.save(cache_npy, gt_cached)
-                                logging.getLogger(__name__).info(
-                                    "GT cloud %s: cached to %s", sid, cache_npy,
+                                gt_cached = (gt_cached - gt_cached.mean(axis=0)).astype(
+                                    np.float32
                                 )
+                                np.save(cache_npy, gt_cached)
+                                _LOG.info("GT cloud %s: cached to %s", sid, cache_npy)
                             break
             self._gt_clouds_cached[sid] = gt_cached
 
@@ -261,20 +294,24 @@ class StoneReconDataset(Dataset):
         stone_id = random.choice(self.stone_ids)
         view_entries = self._view_entries[stone_id]
         fx, fy, cx, cy = self._intrinsics_cache[stone_id]
+        reg = self._registration_params.get(stone_id, {})
+        R_floor_up = reg.get("R_floor_up")
+        turntable_center = reg.get("turntable_center")
+        gt_centroid = reg.get("gt_centroid")
 
         n_available = len(view_entries)
         K = random.randint(self.min_views, min(self.max_views, n_available))
         selected = random.sample(view_entries, K)
 
-        all_pts = []
-        all_seg_labels = []
-        all_view_ids = []
+        all_pts: List[np.ndarray] = []
 
-        for view_i, (frame_idx, npy_path, _pose_unused, mask_path) in enumerate(selected):
+        for frame_idx, npy_path, _pose, mask_path in selected:
             depth = np.load(npy_path).astype(np.float32)
 
             if self.augment and self.depth_noise_sigma > 0:
-                noise = np.random.normal(0, self.depth_noise_sigma, depth.shape).astype(np.float32)
+                noise = np.random.normal(
+                    0, self.depth_noise_sigma, depth.shape
+                ).astype(np.float32)
                 valid_mask = np.isfinite(depth) & (depth > 0)
                 depth[valid_mask] += noise[valid_mask]
 
@@ -284,46 +321,65 @@ class StoneReconDataset(Dataset):
 
             if mask_path is not None:
                 mask_flat = _load_mask_np(mask_path, self.height, self.width)
-                seg_labels = mask_flat[flat_idx].astype(np.float32)
-            else:
-                seg_labels = np.ones(pts_cam.shape[0], dtype=np.float32)
+                stone_sel = mask_flat[flat_idx]
+                pts_cam = pts_cam[stone_sel]
+
+            if pts_cam.shape[0] < 10:
+                continue
 
             if self.augment and self.point_dropout_rate > 0:
                 keep = np.random.rand(pts_cam.shape[0]) > self.point_dropout_rate
                 pts_cam = pts_cam[keep]
-                seg_labels = seg_labels[keep]
 
             if pts_cam.shape[0] > self.max_points_per_view:
                 choice = np.random.choice(
-                    pts_cam.shape[0], self.max_points_per_view, replace=False
+                    pts_cam.shape[0], self.max_points_per_view, replace=False,
                 )
                 pts_cam = pts_cam[choice]
-                seg_labels = seg_labels[choice]
 
-            view_id = np.full(pts_cam.shape[0], view_i, dtype=np.int64)
-            all_pts.append(pts_cam)
-            all_seg_labels.append(seg_labels)
-            all_view_ids.append(view_id)
+            pts_reg = _register_view(
+                pts_cam, frame_idx, R_floor_up,
+                turntable_center, self.angle_per_frame_deg,
+            )
+            all_pts.append(pts_reg)
 
         if not all_pts:
             return self._empty_sample()
 
         points = np.concatenate(all_pts, axis=0)
-        seg_labels = np.concatenate(all_seg_labels, axis=0)
-        view_ids = np.concatenate(all_view_ids, axis=0)
 
-        points = points - points.mean(axis=0)
+        if gt_centroid is not None:
+            points = points - gt_centroid.astype(np.float32)
+        else:
+            points = points - points.mean(axis=0)
 
-        gt_cloud_loaded = self._gt_clouds_cached.get(stone_id)
-        if gt_cloud_loaded is not None:
-            gt_cloud_loaded = gt_cloud_loaded.copy()
+        points = _farthest_point_sample_np(points, self.merged_cloud_points)
+
+        gt_cloud = self._gt_clouds_cached.get(stone_id)
+        if gt_cloud is not None:
+            gt_cloud = gt_cloud.copy()
 
         if self.augment:
+            angle = np.random.uniform(0, 2 * np.pi)
+            R = _rotation_y(angle)
+            points = (points @ R.T).astype(np.float32)
+            if gt_cloud is not None:
+                gt_cloud = (gt_cloud @ R.T).astype(np.float32)
+
             if self.scale_jitter > 0:
                 scale = 1.0 + random.uniform(-self.scale_jitter, self.scale_jitter)
-                points = points * scale
-                if gt_cloud_loaded is not None:
-                    gt_cloud_loaded = gt_cloud_loaded * scale
+                points = (points * scale).astype(np.float32)
+                if gt_cloud is not None:
+                    gt_cloud = (gt_cloud * scale).astype(np.float32)
+
+            if self.xyz_jitter_sigma > 0:
+                noise = np.random.normal(
+                    0, self.xyz_jitter_sigma, points.shape
+                ).astype(np.float32)
+                points = points + noise
+
+        seg_labels = np.ones(points.shape[0], dtype=np.float32)
+        view_ids = np.zeros(points.shape[0], dtype=np.int64)
 
         sample: Dict[str, Any] = {
             "points": torch.from_numpy(points.astype(np.float32)),
@@ -333,10 +389,8 @@ class StoneReconDataset(Dataset):
             "stone_id": stone_id,
         }
 
-        if gt_cloud_loaded is not None:
-            sample["gt_cloud"] = torch.from_numpy(
-                gt_cloud_loaded.astype(np.float32)
-            )
+        if gt_cloud is not None:
+            sample["gt_cloud"] = torch.from_numpy(gt_cloud.astype(np.float32))
 
         if stone_id in self.volumes:
             sample["gt_volume"] = torch.tensor(
@@ -347,10 +401,11 @@ class StoneReconDataset(Dataset):
 
     def _empty_sample(self) -> Dict[str, torch.Tensor]:
         """Fallback for degenerate cases."""
+        n = self.merged_cloud_points
         sample: Dict[str, Any] = {
-            "points": torch.zeros(1, 3),
-            "seg_labels": torch.zeros(1),
-            "view_ids": torch.zeros(1, dtype=torch.int64),
+            "points": torch.zeros(n, 3),
+            "seg_labels": torch.ones(n),
+            "view_ids": torch.zeros(n, dtype=torch.int64),
             "n_views": torch.tensor(0, dtype=torch.int64),
             "stone_id": "",
         }
@@ -363,7 +418,7 @@ def collate_variable_points(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """Custom collate for variable-length point clouds.
 
     Pads all point clouds to the max size in the batch and creates
-    a padding mask. Scalar values are simply stacked.
+    a padding mask.  Scalar values are simply stacked.
     """
     max_pts = max(b["points"].shape[0] for b in batch)
     B = len(batch)

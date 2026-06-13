@@ -1,15 +1,17 @@
-"""StoneReconNet: neural multi-view stone segmentation and registration.
+"""StoneReconNet: neural stone shape completion via rectified flow.
 
-Replaces the classical pipeline (RANSAC + ICP + pose graph) with a trained
-neural model:
-  1. PointNet++ encoder extracts per-view features.
-  2. Segmentation head separates stone from floor/background.
-  3. Multi-view attention fuses features across views (RAP-inspired DiTLayer).
-  4. RPF-style rectified flow learns to register point clouds.
+The model receives a *registered, stone-only* partial point cloud (K views
+merged in a shared frame) and learns to complete the full shape via
+RPF-style flow matching.
 
-At inference, Euler ODE integration produces a registered stone point cloud.
-Poisson surface reconstruction then creates a watertight mesh for volume
-measurement -- no classical registration or TSDF needed.
+Architecture:
+  1. PointNet++ encoder extracts features from the merged partial cloud.
+  2. Self-attention (DiT-style with AdaLN) refines features.
+  3. Flow head predicts per-point velocity field (rectified flow).
+  4. Upsampler expands the sparse flow output for denser meshing.
+
+Alignment and segmentation are handled classically (turntable poses + masks)
+in the dataset, not learned.
 
 Adapted from Rectified Point Flow (RPF), NeurIPS 2025 Spotlight.
 """
@@ -57,15 +59,19 @@ class StoneReconNetConfig:
     attn_dropout: float = 0.0
 
     seg_hidden_dim: int = 128
+    seg_dropout: float = 0.3
 
     # RPF flow parameters
     flow_loss_type: str = "mse"
     timestep_sampling: str = "u_shaped"
-    inference_sampling_steps: int = 10
+    inference_sampling_steps: int = 20
     t_embed_dim: int = 64
 
+    # RAP: inject PE(x_t) into attention tokens at each ODE step
+    use_flow_xyz_for_pos_enc: bool = True
+
     # Flow upsampler: expands flow output for denser Poisson meshing
-    upsample_factor: int = 4
+    upsample_factor: int = 8
 
 
 class SinusoidalTimestepEmbedding(nn.Module):
@@ -192,17 +198,16 @@ class FlowUpsampler(nn.Module):
 
 
 class StoneReconNet(nn.Module):
-    """Neural multi-view stone reconstruction with RPF-style flow registration.
+    """Neural stone shape completion with RPF-style rectified flow.
 
-    Pipeline:
-      1. PointNet++ encodes each view's point cloud (shared weights).
-      2. Segmentation head classifies stone vs floor/background per point.
-      3. Multi-view attention fuses features across views.
-      4. Flow head predicts per-point velocity field (RPF rectified flow).
-      5. Flow upsampler expands sparse flow output to dense cloud.
+    Pipeline (input is already registered and stone-only):
+      1. PointNet++ encodes the merged partial cloud.
+      2. Self-attention (DiT-style) refines features.
+      3. Flow head predicts per-point velocity field.
+      4. Flow upsampler expands sparse flow output to dense cloud.
 
-    Training: segmentation BCE + flow velocity MSE.
-    Inference: segment stone -> Euler ODE registration -> Poisson mesh -> volume.
+    Training: flow velocity MSE + Chamfer distance.
+    Inference: Euler ODE integration -> Poisson mesh -> volume.
     """
 
     def __init__(self, cfg: Optional[StoneReconNetConfig] = None):
@@ -230,6 +235,7 @@ class StoneReconNet(nn.Module):
         self.seg_head = SegmentationHead(
             feature_dim=cfg.feature_dim,
             hidden_dim=cfg.seg_hidden_dim,
+            dropout=cfg.seg_dropout,
         )
 
         self.multi_view_attn = MultiViewAttention(
@@ -255,6 +261,7 @@ class StoneReconNet(nn.Module):
         self.timestep_sampling = cfg.timestep_sampling
         self.flow_loss_type = cfg.flow_loss_type
         self.inference_sampling_steps = cfg.inference_sampling_steps
+        self.use_flow_xyz = cfg.use_flow_xyz_for_pos_enc
 
     # ------------------------------------------------------------------
     # RPF rectified flow methods (adapted from RPF modeling.py)
@@ -300,44 +307,28 @@ class StoneReconNet(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Sequential 3-stage training forward pass.
+        """Training forward pass for shape completion via flow matching.
 
-        Stage 1 -- Segmentation: classify stone vs floor per point.
-        Stage 2 -- Alignment:    soft-gated multi-view attention on stone features.
-        Stage 3 -- Completion:   flow head generates complete stone (vs GT2).
+        Input is already a registered, stone-only merged cloud, so no
+        segmentation gating or multi-view alignment is needed.
 
         Args:
             batch: dict with keys:
-                - points: (B, N, 3) camera-space points (no pose applied)
-                - view_ids: (B, N) view assignment per point
+                - points: (B, N, 3) registered stone-only points
                 - pad_mask: (B, N) True for padded positions
-                - gt_cloud: (B, K, 3) Blender PLY GT (GT2)
+                - gt_cloud: (B, K, 3) registered GT complete cloud
         """
         points = batch["points"]
-        view_ids = batch["view_ids"]
         pad_mask = batch["pad_mask"]
         B, N, _ = points.shape
 
         sa_xyz, sa_feat, global_feat = self.encoder(points, mask=pad_mask)
-
-        seg_logits = self.seg_head(points, sa_xyz, sa_feat)
-        seg_logits = seg_logits.masked_fill(pad_mask, 0.0)
-
-        seg_logits_sa = self._downsample_seg_logits(points, sa_xyz, seg_logits)
-        stone_prob_sa = torch.sigmoid(seg_logits_sa).unsqueeze(-1)
-        gated_feat = sa_feat * stone_prob_sa
-
-        sa_view_ids = self._downsample_view_ids(points, sa_xyz, view_ids)
         M = sa_xyz.shape[1]
+
+        sa_view_ids = torch.zeros(B, M, dtype=torch.long, device=points.device)
         sa_pad_mask = torch.zeros(B, M, dtype=torch.bool, device=points.device)
 
-        fused = self.multi_view_attn(gated_feat, sa_xyz, sa_view_ids, sa_pad_mask)
-
-        output = {
-            "seg_logits": seg_logits,
-            "fused_features": fused,
-            "sa_xyz": sa_xyz,
-        }
+        output: Dict[str, torch.Tensor] = {"sa_xyz": sa_xyz}
 
         if "gt_cloud" in batch:
             gt_cloud = batch["gt_cloud"]
@@ -347,8 +338,14 @@ class StoneReconNet(nn.Module):
             x_1 = torch.randn_like(x_0_sa)
             x_t, v_t = self._compute_flow_target(x_0_sa, x_1, timesteps)
 
+            flow_xyz = x_t if self.use_flow_xyz else None
+            fused = self.multi_view_attn(
+                sa_feat, sa_xyz, sa_view_ids, sa_pad_mask,
+                t=timesteps, flow_xyz=flow_xyz,
+            )
             v_pred = self.flow_head(fused, x_t, timesteps)
 
+            output["fused_features"] = fused
             output["v_pred"] = v_pred
             output["v_t"] = v_t
             output["t"] = timesteps
@@ -356,60 +353,61 @@ class StoneReconNet(nn.Module):
             output["x_1"] = x_1
             output["x_t"] = x_t
 
-            upsampled = self.flow_upsampler(x_0_sa, fused)
+            upsample_xyz = x_0_sa
+            if self.training:
+                upsample_xyz = x_0_sa + 0.005 * torch.randn_like(x_0_sa)
+            upsampled = self.flow_upsampler(upsample_xyz, fused.detach())
             output["upsampled_points"] = upsampled
             output["gt_cloud"] = gt_cloud
+        else:
+            fused = self.multi_view_attn(
+                sa_feat, sa_xyz, sa_view_ids, sa_pad_mask,
+            )
+            output["fused_features"] = fused
 
         return output
 
     def forward_inference(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Inference forward: encode, segment, fuse features."""
+        """Inference forward: encode the registered partial cloud."""
         points = batch["points"]
-        view_ids = batch["view_ids"]
         pad_mask = batch["pad_mask"]
         B, N, _ = points.shape
 
         sa_xyz, sa_feat, global_feat = self.encoder(points, mask=pad_mask)
-
-        seg_logits = self.seg_head(points, sa_xyz, sa_feat)
-        seg_logits = seg_logits.masked_fill(pad_mask, 0.0)
-
-        seg_logits_sa = self._downsample_seg_logits(points, sa_xyz, seg_logits)
-        stone_prob_sa = torch.sigmoid(seg_logits_sa).unsqueeze(-1)
-        gated_feat = sa_feat * stone_prob_sa
-
-        sa_view_ids = self._downsample_view_ids(points, sa_xyz, view_ids)
         M = sa_xyz.shape[1]
+
+        sa_view_ids = torch.zeros(B, M, dtype=torch.long, device=points.device)
         sa_pad_mask = torch.zeros(B, M, dtype=torch.bool, device=points.device)
 
-        fused = self.multi_view_attn(gated_feat, sa_xyz, sa_view_ids, sa_pad_mask)
-
         return {
-            "seg_logits": seg_logits,
-            "fused_features": fused,
-            "sa_xyz": sa_xyz,
             "sa_feat": sa_feat,
+            "sa_xyz": sa_xyz,
             "sa_view_ids": sa_view_ids,
+            "sa_pad_mask": sa_pad_mask,
         }
 
     @torch.inference_mode()
     def sample_rectified_flow(
         self, batch: Dict[str, torch.Tensor],
         num_steps: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Euler ODE integration followed by learned upsampling.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Euler ODE with flow-aware attention at each step (RAP-style).
+
+        At each ODE step, the attention stack is re-run with the current
+        timestep t so that AdaLN conditions every layer on the flow state.
 
         Returns:
             flow_points: (B, M, 3) raw flow output (SA-level, 512 pts).
-            upsampled_points: (B, M*factor, 3) dense cloud (2048 pts).
-            seg_logits: (B, N) per-point segmentation logits.
+            upsampled_points: (B, M*factor, 3) dense cloud.
         """
         if num_steps is None:
             num_steps = self.inference_sampling_steps
 
         inf_out = self.forward_inference(batch)
-        fused = inf_out["fused_features"]
+        sa_feat = inf_out["sa_feat"]
         sa_xyz = inf_out["sa_xyz"]
+        sa_view_ids = inf_out["sa_view_ids"]
+        sa_pad_mask = inf_out["sa_pad_mask"]
         B, M, _ = sa_xyz.shape
 
         x_t = torch.randn(B, M, 3, device=sa_xyz.device)
@@ -418,12 +416,23 @@ class StoneReconNet(nn.Module):
         for step in range(num_steps):
             t_val = 1.0 - step * dt
             t_tensor = torch.full((B,), t_val, device=sa_xyz.device)
+
+            flow_xyz = x_t if self.use_flow_xyz else None
+            fused = self.multi_view_attn(
+                sa_feat, sa_xyz, sa_view_ids, sa_pad_mask,
+                t=t_tensor, flow_xyz=flow_xyz,
+            )
             v_pred = self.flow_head(fused, x_t, t_tensor)
             x_t = x_t - v_pred * dt
 
-        upsampled = self.flow_upsampler(x_t, fused)
+        flow_xyz_final = x_t if self.use_flow_xyz else None
+        fused_final = self.multi_view_attn(
+            sa_feat, sa_xyz, sa_view_ids, sa_pad_mask,
+            flow_xyz=flow_xyz_final,
+        )
+        upsampled = self.flow_upsampler(x_t, fused_final)
 
-        return x_t, upsampled, inf_out["seg_logits"]
+        return x_t, upsampled
 
     # ------------------------------------------------------------------
     # Helpers
