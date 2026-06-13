@@ -270,7 +270,7 @@ class StoneReconDataset(Dataset):
                     _LOG.info("GT cloud %s: loaded from cache (%d pts)",
                               sid, gt_cached.shape[0])
                 else:
-                    for suffix in ("_gt_pointcloud.ply", "_gt_complete.ply", "_gt.ply"):
+                    for suffix in ("_gt_aligned.ply", "_gt_pointcloud.ply", "_gt_complete.ply", "_gt.ply"):
                         candidate = os.path.join(gt_cloud_dir, f"{sid}{suffix}")
                         if os.path.isfile(candidate):
                             _LOG.info("GT cloud %s: loading %s ...", sid, candidate)

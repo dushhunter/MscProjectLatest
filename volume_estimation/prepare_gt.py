@@ -340,9 +340,9 @@ def process_one_stone(
     )
 
     os.makedirs(output_dir, exist_ok=True)
-    ply_path = os.path.join(output_dir, f"{stone_id}_gt_pointcloud.ply")
+    ply_path = os.path.join(output_dir, f"{stone_id}_depthmerge_ref.ply")
     o3d.io.write_point_cloud(ply_path, pcd)
-    LOG.info("  Saved: %s", ply_path)
+    LOG.info("  Saved depth-merge reference: %s", ply_path)
 
     reg_path = os.path.join(output_dir, f"{stone_id}_registration.npz")
     reg_data = {"gt_centroid": gt_centroid.astype(np.float64)}

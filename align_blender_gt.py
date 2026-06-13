@@ -181,7 +181,7 @@ def align_one_stone(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.003, max_nn=30)
     )
 
-    out_path = os.path.join(output_dir, f"{stone_id}_gt_pointcloud.ply")
+    out_path = os.path.join(output_dir, f"{stone_id}_gt_aligned.ply")
     o3d.io.write_point_cloud(out_path, out_pcd)
     LOG.info("  Saved aligned GT: %s (%d pts)", out_path, n_final)
 

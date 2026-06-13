@@ -618,7 +618,7 @@ def main():
 
     gt_cloud_path = args.gt_cloud
     if gt_cloud_path is None and args.gt_cloud_dir:
-        for suffix in ("_gt_pointcloud.ply", "_gt.ply"):
+        for suffix in ("_gt_aligned.ply", "_gt_pointcloud.ply", "_gt.ply"):
             candidate = os.path.join(
                 args.gt_cloud_dir, f"{args.sequence}{suffix}"
             )
