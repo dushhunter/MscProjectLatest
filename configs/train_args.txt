@@ -1,38 +1,50 @@
---data_path /home/dilan/msc_research/StoneVolMain/stone_syn_dataset
+--data_path /home/dilan/msc_research/StoneDepthTrain/stone_syn_dataset
 --dataset stone
 --split stone
---intrinsics_file_path /home/dilan/msc_research/StoneVolMain/splits/stone/intrinsics.txt
+--intrinsics_file_path /home/dilan/msc_research/StoneDepthTrain/splits/stone/intrinsics.txt
 --height 576
 --width 1024
 --batch_size 1
+--accumulation_steps 8
 --num_epochs 30
 --frame_ids 0 -1 1
---min_depth 0.3
---max_depth 0.8
+--min_depth 0.30
+--max_depth 1.00
 --learning_rate 1e-4
+--scheduler_step_size 40
+--backbone convnext_large
 --model_dim 32
 --query_nums 64
 --patch_size 16
---dim_out 512
+--dim_out 1024
+--decoder_norm group
+--prob_temperature 0.7
+--edge_refine_channels 32
+--weight_decay 1e-2
 --log_dir stone_weights
---model_name my_stone_experiment_32bit_L1_mask_2
+--model_name my_stone_experiment_mm_absrel_v1
 --use_known_pose
 --turntable_angle_deg 3.0
 --use_gt_depth
---gt_depth_path /home/dilan/msc_research/StoneVolMain/stone_syn_dataset
+--gt_depth_path /home/dilan/msc_research/StoneDepthTrain/stone_syn_dataset
 --gt_depth_subdir data_depth_annotated/train/groundtruth_float32png
 --gt_depth_encoding float32_rgba
---gt_depth_weight 10
---disable_automasking
---use_multiview_loss
---consistency_weight 0.1
---use_smoothness_loss
---smoothness_weight 0.001
---accumulation_steps 4
---gt_grad_weight 0.7
---gt_normal_weight 0.3
+--gt_depth_weight 0.3
+--use_berhu_loss
+--gt_silog_weight 0.0
+--gt_grad_weight 1.5
+--gt_normal_weight 0.2
+--gt_relief_weight 1.0
+--gt_curvature_weight 0.1
+--gt_plane_weight 2.0
 --use_mask
+--stone_loss_weight 3.0
+--boundary_loss_weight 3.0
+--disable_automasking
+--use_smoothness_loss
+--smoothness_weight 0.0005
+--use_strong_aug
 --mlflow
 --mlflow_tracking_uri file:./mlruns
---mlflow_experiment_name StoneVolMain-train-with-mask
+--mlflow_experiment_name StoneDepthTrain-train-mm
 --mlflow_tags pipeline=train,dataset=stone
