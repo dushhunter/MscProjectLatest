@@ -2,14 +2,19 @@
 --backbone convnext_large
 --model_dim 32
 --patch_size 16
---dim_out 128
+--dim_out 1024
 --query_nums 64
 --dec_channels 1024 512 256 128
---min_depth 0.01
---max_depth 1.0
+--min_depth 0.3
+--max_depth 1.00
+--decoder_norm group
+--prob_temperature 0.7
 --load_pretrained_model
---load_pt_folder stone_weights/my_stone_experiment_32bit_L1_mask/models/weights_*
+--load_pt_folder /home/dilan/msc_research/StoneDepthTrain/stone_weights/my_stone_experiment_mm_absrel_v1/models/weights_29
 --image_path test_results
 --ext png
 --height 576
 --width 1024
+--edge_upsample
+--edge_upsample_radius 8
+--edge_upsample_eps 0.001
